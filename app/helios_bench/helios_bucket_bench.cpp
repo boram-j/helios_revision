@@ -142,6 +142,47 @@ static size_t ct_serial_bytes(const Ciphertext& ct) {
 }
 
 // ============================================================
+//  Targeted Galois element computation
+//
+//  create_galois_keys() with no args generates keys for ALL rotation
+//  steps, which at poly_degree=32768 is O(N) elements — extremely slow
+//  (~100s even on fast hardware, may hang on servers).
+//
+//  We only need:
+//    (a) Row rotation steps used by rotation_sum_row:
+//        s = 1, 2, 4, ..., row_slots/2 = 8192  (14 elements)
+//    (b) Column rotation for rotate_columns:
+//        Galois element = 2*N - 1  (1 element)
+//  Total: 15 elements instead of O(N).
+//
+//  Formula: row rotation by step k → element = 3^(2k) mod (2*N)
+//           column rotation           element = 2*N - 1
+// ============================================================
+static std::vector<uint32_t> needed_galois_elts(size_t poly_deg)
+{
+    // modular exponentiation: base^exp mod mod
+    auto powmod = [](uint64_t base, uint64_t exp, uint64_t mod) -> uint32_t {
+        uint64_t result = 1; base %= mod;
+        while (exp > 0) {
+            if (exp & 1) result = result * base % mod;
+            base = base * base % mod;
+            exp >>= 1;
+        }
+        return (uint32_t)result;
+    };
+
+    uint64_t two_N = 2 * poly_deg;
+    std::vector<uint32_t> elts;
+    // rotation_sum_row: halving steps from row_slots/2 down to 1
+    int row_slots = (int)poly_deg / 2;
+    for (int s = row_slots >> 1; s >= 1; s >>= 1)
+        elts.push_back(powmod(3, (uint64_t)(2 * s), two_N));
+    // rotate_columns: element = 2*N - 1
+    elts.push_back((uint32_t)(two_N - 1));
+    return elts;
+}
+
+// ============================================================
 //  Plaintext reference: global COUNT
 // ============================================================
 static int64_t plaintext_count(
@@ -542,12 +583,14 @@ static bool multi_seed_check(
     Encryptor& encryptor, Decryptor& decryptor,
     BatchEncoder& benc,
     const RelinKeys& rk, const GaloisKeys& gk,
-    int row_slots, int total_slots)
+    int row_slots, int total_slots,
+    int n_seeds = SEED_CHECK_K)
 {
-    std::cout << "[Correctness] " << SEED_CHECK_K << " seeds"
+    std::cout << "[Correctness] " << n_seeds << " seed(s)"
               << " (n=" << SEED_CHECK_N << " m=" << SEED_CHECK_M << ") ...\n";
     int failures = 0;
-    for (int seed = 0; seed < SEED_CHECK_K; seed++) {
+    for (int seed = 0; seed < n_seeds; seed++) {
+        std::cout << "  seed " << (seed + 1) << "/" << n_seeds << " ..." << std::flush;
         std::mt19937_64 rng((uint64_t)seed * 1000003 + 7);
         std::uniform_int_distribution<int64_t> dist(0, VALUE_RANGE - 1);
         std::vector<int64_t> A(SEED_CHECK_N), B(SEED_CHECK_M);
@@ -561,17 +604,20 @@ static bool multi_seed_check(
             comp, eval, encryptor, decryptor, benc, rk, gk,
             row_slots, total_slots, ops, /*fused=*/true, wall);
         if (fhe != gt) {
-            std::cout << "    FAIL seed=" << seed
-                      << " A=["; for (auto v:A) std::cout<<v<<",";
-            std::cout << "] B=["; for (auto v:B) std::cout<<v<<",";
-            std::cout << "] gt=" << gt << " fhe=" << fhe << "\n";
+            std::cout << " FAIL (gt=" << gt << " fhe=" << fhe << ")\n";
+            std::cout << "    A=["; for (auto v:A) std::cout<<v<<",";
+            std::cout << "]\n    B=["; for (auto v:B) std::cout<<v<<",";
+            std::cout << "]\n";
             failures++;
+        } else {
+            std::cout << " PASS  (" << std::fixed << std::setprecision(1)
+                      << wall << "s  gt=" << gt << ")\n";
         }
     }
     if (failures == 0)
-        std::cout << "  PASS (" << SEED_CHECK_K << "/" << SEED_CHECK_K << " seeds correct)\n\n";
+        std::cout << "  ALL PASS (" << n_seeds << "/" << n_seeds << " seeds correct)\n\n";
     else
-        std::cout << "  FAIL (" << failures << " seed(s) incorrect)\n\n";
+        std::cout << "  FAIL (" << failures << " seed(s) incorrect out of " << n_seeds << ")\n\n";
     return failures == 0;
 }
 
@@ -743,6 +789,9 @@ static void print_results(
 // ============================================================
 int main(int argc, char* argv[])
 {
+    // Flush every write immediately so progress shows through tee/pipes on Linux.
+    std::cout.setf(std::ios::unitbuf);
+
     int  N_B   = 1974;
     int  M_B   = 1028;
     bool quick = false;
@@ -777,7 +826,7 @@ int main(int argc, char* argv[])
     SecretKey    sk = keygen.secret_key();
     PublicKey    pk; keygen.create_public_key(pk);
     RelinKeys    rlk; keygen.create_relin_keys(rlk);
-    GaloisKeys   gk;  keygen.create_galois_keys(gk);
+    GaloisKeys   gk;  keygen.create_galois_keys(needed_galois_elts(POLY_DEG), gk);
 
     Encryptor    encryptor(context, pk);
     Evaluator    evaluator(context);
@@ -804,24 +853,26 @@ int main(int argc, char* argv[])
                   << std::fixed << std::setprecision(2) << ct_mb << " MB)\n\n";
     }
 
-    // ---- Calibration -----------------------------------------------------
-    std::cout << "[Calibration]\n";
-    PerOpTimes T = calibrate(comparator, evaluator, encryptor, benc, rlk, gk, total_slots);
-    std::cout << "\n";
-
-    // ---- Multi-seed correctness check ------------------------------------
+    // ---- Correctness check (1 seed in quick mode, 20 in full mode) ------
+    // Run BEFORE calibration so 'quick' exits without paying calibration cost.
+    int n_seeds = quick ? 1 : SEED_CHECK_K;
     bool seed_ok = multi_seed_check(
         comparator, evaluator, encryptor, decryptor, benc, rlk, gk,
-        row_slots, total_slots);
+        row_slots, total_slots, n_seeds);
     if (!seed_ok) {
         std::cerr << "ERROR: correctness check failed. Fix comparator before full run.\n";
         return 1;
     }
 
     if (quick) {
-        std::cout << "Quick mode: seed check passed. Exiting.\n";
+        std::cout << "Quick mode: 1-seed check passed. Exiting.\n";
         return 0;
     }
+
+    // ---- Calibration (full bench mode only) ------------------------------
+    std::cout << "[Calibration]\n";
+    PerOpTimes T = calibrate(comparator, evaluator, encryptor, benc, rlk, gk, total_slots);
+    std::cout << "\n";
 
     // ---- Tiling preview --------------------------------------------------
     int inner_m_d  = std::min(N_B, M_B);
