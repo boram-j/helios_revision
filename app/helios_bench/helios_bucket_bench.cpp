@@ -142,44 +142,30 @@ static size_t ct_serial_bytes(const Ciphertext& ct) {
 }
 
 // ============================================================
-//  Targeted Galois element computation
+//  Targeted Galois step list
 //
 //  create_galois_keys() with no args generates keys for ALL rotation
-//  steps, which at poly_degree=32768 is O(N) elements — extremely slow
-//  (~100s even on fast hardware, may hang on servers).
+//  steps — O(N) elements at poly_degree=32768, which is very slow.
 //
 //  We only need:
-//    (a) Row rotation steps used by rotation_sum_row:
-//        s = 1, 2, 4, ..., row_slots/2 = 8192  (14 elements)
+//    (a) Row rotation steps for rotation_sum_row:
+//        s = 1, 2, 4, ..., 8192  (14 steps)
 //    (b) Column rotation for rotate_columns:
-//        Galois element = 2*N - 1  (1 element)
-//  Total: 15 elements instead of O(N).
+//        step = 0  (SEAL's special value for the column-swap key)
+//  Total: 15 steps → 15 Galois keys instead of O(N).
 //
-//  Formula: row rotation by step k → element = 3^(2k) mod (2*N)
-//           column rotation           element = 2*N - 1
+//  Using SEAL's int-steps API avoids having to compute raw Galois
+//  elements ourselves (the formula is 3^step mod 2N, and step 0 is
+//  a special case that returns element 2N-1 for the column swap).
 // ============================================================
-static std::vector<uint32_t> needed_galois_elts(size_t poly_deg)
+static std::vector<int> needed_galois_steps()
 {
-    // modular exponentiation: base^exp mod mod
-    auto powmod = [](uint64_t base, uint64_t exp, uint64_t mod) -> uint32_t {
-        uint64_t result = 1; base %= mod;
-        while (exp > 0) {
-            if (exp & 1) result = result * base % mod;
-            base = base * base % mod;
-            exp >>= 1;
-        }
-        return (uint32_t)result;
-    };
-
-    uint64_t two_N = 2 * poly_deg;
-    std::vector<uint32_t> elts;
-    // rotation_sum_row: halving steps from row_slots/2 down to 1
-    int row_slots = (int)poly_deg / 2;
+    std::vector<int> steps;
+    steps.push_back(0);  // column rotation (rotate_columns)
+    int row_slots = (int)(POLY_DEG / 2);  // = 16384
     for (int s = row_slots >> 1; s >= 1; s >>= 1)
-        elts.push_back(powmod(3, (uint64_t)(2 * s), two_N));
-    // rotate_columns: element = 2*N - 1
-    elts.push_back((uint32_t)(two_N - 1));
-    return elts;
+        steps.push_back(s);              // 8192, 4096, ..., 1
+    return steps;
 }
 
 // ============================================================
@@ -826,7 +812,7 @@ int main(int argc, char* argv[])
     SecretKey    sk = keygen.secret_key();
     PublicKey    pk; keygen.create_public_key(pk);
     RelinKeys    rlk; keygen.create_relin_keys(rlk);
-    GaloisKeys   gk;  keygen.create_galois_keys(needed_galois_elts(POLY_DEG), gk);
+    GaloisKeys   gk;  keygen.create_galois_keys(needed_galois_steps(), gk);
 
     Encryptor    encryptor(context, pk);
     Evaluator    evaluator(context);
