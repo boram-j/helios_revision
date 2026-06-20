@@ -8,11 +8,14 @@
 #   ../run_helios_bench.sh
 #
 # Output:
-#   togepi/bench_quick.txt       — 20-seed correctness check
+#   togepi/bench_quick.txt       — 1-seed correctness check (quick sanity)
 #   togepi/bench_256x512.txt     — 256 x 512
 #   togepi/bench_512x256.txt     — 512 x 256  (orientation swap)
 #   togepi/bench_1974x1028.txt   — 1974 x 1028  (NC Bucket C)
-#   helios_bench_results.csv         — appended by each run
+#   helios_bench_results.csv     — appended by each run
+#
+# Note: stdbuf -oL forces line-buffered output from the C++ binary so progress
+#       prints appear immediately even when piped through tee.
 
 set -euo pipefail
 
@@ -41,7 +44,7 @@ run_bench() {
     local t_start
     t_start=$(date +%s)
 
-    "$BENCH" "$n_b" "$m_b" 2>&1 | tee "$logfile"
+    stdbuf -oL "$BENCH" "$n_b" "$m_b" 2>&1 | tee "$logfile"
     local bench_exit=${PIPESTATUS[0]}
 
     local t_end
@@ -60,13 +63,13 @@ run_bench() {
 }
 
 # ----------------------------------------------------------------
-# 0. Quick sanity check (20-seed correctness)
+# 0. Quick sanity check (1-seed correctness)
 # ----------------------------------------------------------------
 hr
-echo "[$(ts)]  Quick correctness check (20 seeds, n=8 m=6) ..."
+echo "[$(ts)]  Quick correctness check (1 seed, n=8 m=6) ..."
 hr
 
-"$BENCH" quick 2>&1 | tee "$LOG_DIR/bench_quick.txt"
+stdbuf -oL "$BENCH" quick 2>&1 | tee "$LOG_DIR/bench_quick.txt"
 quick_exit=${PIPESTATUS[0]}
 
 if [ "$quick_exit" -ne 0 ]; then
