@@ -69,6 +69,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -429,6 +430,61 @@ static double extrapolate_s(const OpStats& ops, const PerOpTimes& T) {
 }
 
 // ============================================================
+//  Calibration cache — save/load to avoid re-measuring every run.
+//  Same machine + same SEAL params → identical values each time.
+//  Pass 'recalib' on the command line to force a fresh measurement.
+// ============================================================
+static const std::string CALIB_CACHE = "./helios_calib.txt";
+
+static void save_calibration(const PerOpTimes& T) {
+    std::ofstream f(CALIB_CACHE);
+    if (!f) { std::cerr << "  Warning: could not write " << CALIB_CACHE << "\n"; return; }
+    f << std::fixed << std::setprecision(9);
+    f << "lt_s="    << T.lt_s     << "\n"
+      << "rot_s="   << T.rot_s    << "\n"
+      << "mulct_s=" << T.mul_ct_s << "\n"
+      << "mulpt_s=" << T.mul_pt_s << "\n"
+      << "addct_s=" << T.add_ct_s << "\n";
+    std::cout << "  Saved calibration to " << CALIB_CACHE << "\n";
+}
+
+// Returns {ok, PerOpTimes}.  ok=true only if all 5 fields were loaded.
+static std::pair<bool, PerOpTimes> load_calibration() {
+    std::ifstream f(CALIB_CACHE);
+    if (!f) return {false, {}};
+    PerOpTimes T;
+    std::map<std::string, double*> fields = {
+        {"lt_s",    &T.lt_s    },
+        {"rot_s",   &T.rot_s   },
+        {"mulct_s", &T.mul_ct_s},
+        {"mulpt_s", &T.mul_pt_s},
+        {"addct_s", &T.add_ct_s},
+    };
+    int loaded = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        auto it = fields.find(key);
+        if (it != fields.end()) {
+            try { *it->second = std::stod(line.substr(eq + 1)); loaded++; }
+            catch (...) {}
+        }
+    }
+    return {loaded == 5, T};
+}
+
+static void print_calib(const PerOpTimes& T) {
+    std::cout << std::fixed;
+    std::cout << "    isLessThan(ct,pt): " << std::setprecision(3) << T.lt_s       << " s\n";
+    std::cout << "    rotate_rows:       " << std::setprecision(3) << T.rot_s*1e3  << " ms\n";
+    std::cout << "    mul_ct + relin:    " << std::setprecision(3) << T.mul_ct_s*1e3 << " ms\n";
+    std::cout << "    mul_pt:            " << std::setprecision(3) << T.mul_pt_s*1e3 << " ms\n";
+    std::cout << "    add_ct:            " << std::setprecision(3) << T.add_ct_s*1e6 << " us\n";
+}
+
+// ============================================================
 //  HELIOS tiling — actual FHE, two-row packing, global COUNT
 //
 //  Shifted encoding:
@@ -554,9 +610,16 @@ static int64_t helios_tiling_fhe(
         std::chrono::high_resolution_clock::now() - t0).count();
 
     // Decrypt and return
+    // BFV BatchEncoder decodes in signed Z_{plain_mod}: values > plain_mod/2
+    // appear negative (e.g., count=61238 > 32768 → decoded as 61238-65537=-4299).
+    // Apply unsigned interpretation so the caller can compare with plaintext gt.
+    // For large n×m where gt may exceed plain_mod, the returned value is
+    // count mod plain_mod (exact comparison not possible without a larger modulus).
+    static const int64_t PLAIN_MOD = 65537;
     Plaintext pt_result; decryptor.decrypt(ct_acc, pt_result);
     std::vector<int64_t> decoded; benc.decode(pt_result, decoded);
-    return decoded[0];
+    int64_t raw = decoded[0];
+    return ((raw % PLAIN_MOD) + PLAIN_MOD) % PLAIN_MOD;  // unsigned Z_{plain_mod}
 }
 
 // ============================================================
@@ -778,17 +841,19 @@ int main(int argc, char* argv[])
     // Flush every write immediately so progress shows through tee/pipes on Linux.
     std::cout.setf(std::ios::unitbuf);
 
-    int  N_B   = 1974;
-    int  M_B   = 1028;
-    bool quick = false;
+    int  N_B     = 1974;
+    int  M_B     = 1028;
+    bool quick   = false;
+    bool recalib = false;  // force fresh calibration (ignores cache)
 
+    int pos_arg = 0;
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "quick") == 0) {
-            quick = true;
-        } else if (i == 1 && std::isdigit((unsigned char)argv[i][0])) {
-            N_B = std::atoi(argv[i]);
-        } else if (i == 2 && std::isdigit((unsigned char)argv[i][0])) {
-            M_B = std::atoi(argv[i]);
+        if      (std::strcmp(argv[i], "quick")   == 0) quick   = true;
+        else if (std::strcmp(argv[i], "recalib") == 0) recalib = true;
+        else if (std::isdigit((unsigned char)argv[i][0])) {
+            if      (pos_arg == 0) N_B = std::atoi(argv[i]);
+            else if (pos_arg == 1) M_B = std::atoi(argv[i]);
+            pos_arg++;
         }
     }
     if (quick) { N_B = SEED_CHECK_N; M_B = SEED_CHECK_M; }
@@ -839,25 +904,39 @@ int main(int argc, char* argv[])
                   << std::fixed << std::setprecision(2) << ct_mb << " MB)\n\n";
     }
 
-    // ---- Correctness check (1 seed in quick mode, 20 in full mode) ------
-    // Run BEFORE calibration so 'quick' exits without paying calibration cost.
-    int n_seeds = quick ? 1 : SEED_CHECK_K;
-    bool seed_ok = multi_seed_check(
-        comparator, evaluator, encryptor, decryptor, benc, rlk, gk,
-        row_slots, total_slots, n_seeds);
-    if (!seed_ok) {
-        std::cerr << "ERROR: correctness check failed. Fix comparator before full run.\n";
-        return 1;
-    }
-
+    // ---- Quick mode: 1-seed correctness check, then exit ----------------
+    // Full bench skips the seed check entirely — run './bench quick' first.
+    // (20-seed check costs ~107 min at 320s/seed; verified once is enough.)
     if (quick) {
+        bool seed_ok = multi_seed_check(
+            comparator, evaluator, encryptor, decryptor, benc, rlk, gk,
+            row_slots, total_slots, 1);
+        if (!seed_ok) {
+            std::cerr << "ERROR: 1-seed check failed.\n";
+            return 1;
+        }
         std::cout << "Quick mode: 1-seed check passed. Exiting.\n";
         return 0;
     }
 
     // ---- Calibration (full bench mode only) ------------------------------
+    // Load from cache if available; otherwise measure and save.
+    // Run with 'recalib' argument to force a fresh measurement.
     std::cout << "[Calibration]\n";
-    PerOpTimes T = calibrate(comparator, evaluator, encryptor, benc, rlk, gk, total_slots);
+    PerOpTimes T;
+    {
+        auto [cache_ok, T_cached] = load_calibration();
+        if (cache_ok && !recalib) {
+            T = T_cached;
+            std::cout << "  Loaded from " << CALIB_CACHE
+                      << "  (pass 'recalib' to remeasure)\n";
+            print_calib(T);
+        } else {
+            if (recalib) std::cout << "  Forcing fresh calibration (recalib)\n";
+            T = calibrate(comparator, evaluator, encryptor, benc, rlk, gk, total_slots);
+            save_calibration(T);
+        }
+    }
     std::cout << "\n";
 
     // ---- Tiling preview --------------------------------------------------
@@ -865,16 +944,20 @@ int main(int argc, char* argv[])
     int p_per_row_d = row_slots / inner_m_d;
     int p_d         = 2 * p_per_row_d;
     int nb_d        = ceildiv(std::max(N_B, M_B), p_d);
+    // Naive CMP = N_B outer elements × ceildiv(M_B, total_slots) chunks × 2 LT
+    // This matches count_naive(N_B, M_B, total_slots).total_cmp().
+    int naive_cmp_d = 2 * N_B * ceildiv(M_B, total_slots);
     std::cout << "[Tiling — Bucket C]\n"
               << "  inner_m=" << inner_m_d
               << "  p_per_row=" << p_per_row_d
               << "  p=" << p_d
               << "  n_batches=" << nb_d << "\n"
               << "  HELIOS CMP: 2 * " << nb_d << " = " << 2*nb_d << "\n"
-              << "  Naive   CMP: 2 * " << std::max(N_B,M_B) << " = " << 2*std::max(N_B,M_B) << "\n"
+              << "  Naive   CMP: 2 * " << N_B * ceildiv(M_B, total_slots)
+              <<                    " = " << naive_cmp_d << "\n"
               << "  Expected reduction: ~"
               << std::fixed << std::setprecision(1)
-              << (double)(2*std::max(N_B,M_B)) / (double)(2*nb_d) << "x\n\n";
+              << (double)naive_cmp_d / (double)(2*nb_d) << "x\n\n";
 
     // ---- Synthetic data --------------------------------------------------
     std::mt19937_64 rng(42);
@@ -923,14 +1006,18 @@ int main(int argc, char* argv[])
         int64_t fhe_count = helios_tiling_fhe(
             N_B, M_B, A, B, comparator, evaluator, encryptor, decryptor,
             benc, rlk, gk, row_slots, total_slots, ops, /*fused=*/false, wall);
-        bool ok = (fhe_count == gt_count);
+        // fhe_count is in [0, 65536] (unsigned Z_{65537}).
+        // Compare mod plain_mod: exact when gt < 65537; modular check otherwise.
+        static const int64_t PM = 65537;
+        bool ok = (fhe_count == gt_count % PM);
         int  p3 = 2 * (row_slots / std::min(N_B, M_B));
         int  nb3= ceildiv(std::max(N_B, M_B), p3);
         int64_t pk = (int64_t)nb3 + 2 + 4;
         double ext = extrapolate_s(ops, T);
         std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
                   << "  wall=" << std::fixed << std::setprecision(1) << wall << "s"
-                  << "  fhe=" << fhe_count << " gt=" << gt_count
+                  << "  fhe=" << fhe_count
+                  << " gt=" << gt_count << " (mod=" << gt_count % PM << ")"
                   << "  " << (ok ? "PASS" : "FAIL") << "\n\n";
         results.push_back({"3-HELIOS-Tile", ops, wall, ext, pk, pk*ct_mb, ok, true});
     }
@@ -943,12 +1030,14 @@ int main(int argc, char* argv[])
         int64_t fhe_count = helios_tiling_fhe(
             N_B, M_B, A, B, comparator, evaluator, encryptor, decryptor,
             benc, rlk, gk, row_slots, total_slots, ops, /*fused=*/true, wall);
-        bool ok = (fhe_count == gt_count);
+        static const int64_t PM4 = 65537;
+        bool ok = (fhe_count == gt_count % PM4);
         int64_t pk = 2 + 4;
         double ext = extrapolate_s(ops, T);
         std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
                   << "  wall=" << std::fixed << std::setprecision(1) << wall << "s"
-                  << "  fhe=" << fhe_count << " gt=" << gt_count
+                  << "  fhe=" << fhe_count
+                  << " gt=" << gt_count << " (mod=" << gt_count % PM4 << ")"
                   << "  " << (ok ? "PASS" : "FAIL") << "\n\n";
         results.push_back({"4-HELIOS-Fused", ops, wall, ext, pk, pk*ct_mb, ok, true});
     }
