@@ -4,6 +4,13 @@
  * Benchmarks four compiler backends for encrypted band-join |A.x - B.y| <= Delta.
  * Output semantic: global COUNT(*) — one encrypted scalar.
  *
+ * A3: Also computes SUM(payload) — a synthetic bounded integer attribute of the
+ *     outer record — in the same FHE pass as COUNT (no second pass).
+ * A4: Optional date-band mode (pass 'dateband' CLI flag): replaces synthetic
+ *     integer values with days-since-epoch dates and a 30-day window.
+ * A5: Replaces scalar peak_cts with a 4-category MemStats breakdown:
+ *     layout_cts / work_cts / materialized_cts / resident_cts (all analytical).
+ *
  * -------------------------------------------------------------------------
  * BFV SLOT GEOMETRY
  * -------------------------------------------------------------------------
@@ -39,6 +46,9 @@
  * Padding slots use outer_vec = 0:
  *   diff = 0 - INNER[j] ≡ 65537-INNER[j]  >> 81  → no false match.
  *
+ * Date-band mode (A4): OFFSET=DATE_RANGE=3650, INNER values ∈ [10000,13649].
+ *   Padding diff = 0-INNER ≡ 65537-INNER ∈ [51888,55537] >> DATE_CMP_HI=3681 ✓
+ *
  * -------------------------------------------------------------------------
  * BACKEND NOTES
  * -------------------------------------------------------------------------
@@ -54,7 +64,9 @@
  *   cmake .. -DCMAKE_BUILD_TYPE=Release
  *   make helios_bucket_bench -j$(sysctl -n hw.logicalcpu)
  *   ./bin/helios_bucket_bench [N_B] [M_B]
- *   ./bin/helios_bucket_bench quick          # n=20, m=10, 20-seed check
+ *   ./bin/helios_bucket_bench quick          # n=8, m=6, 1-seed check
+ *   ./bin/helios_bucket_bench dateband       # A4: date-band residual mode
+ *   ./bin/helios_bucket_bench recalib        # force fresh calibration
  */
 
 #include "nshedb/nshedb.h"
@@ -94,6 +106,22 @@ static const int    CMP_HI      = OFFSET + DELTA + 1;      // = 81  (positive)
 // outer_vec padding: 0.  diff = 0 - INNER[j] wraps to ~65537 >> CMP_HI → no match.
 static const int    PAD_OUTER   = 0;
 
+// A3: payload bound — keeps individual payload values small so per-slot
+//     accumulation stays well below plain_mod/n_batches for small test sizes.
+static const int    PAYLOAD_BOUND = 100;
+
+// A4: date-band residual constants (days-since-epoch representation)
+static const int    BASE_DATE   = 10000;  // epoch offset in days
+static const int    DATE_RANGE  = 3650;   // 10-year span in days
+static const int    DELTA_DAYS  = 30;     // registration-date window (days)
+// Shifted predicate for date mode:
+//   diff = (a_date - b_date) + DATE_RANGE  ∈ [DATE_RANGE-3649, DATE_RANGE+3649]
+//   match iff DATE_RANGE-30 <= diff <= DATE_RANGE+30
+//   isLessThan bounds: DATE_RANGE-31 < diff < DATE_RANGE+31
+static const int    DATE_OFFSET = DATE_RANGE;               // = 3650
+static const int    DATE_CMP_LO = DATE_RANGE - DELTA_DAYS - 1;  // = 3619
+static const int    DATE_CMP_HI = DATE_RANGE + DELTA_DAYS + 1;  // = 3681
+
 static const int    CALIB_N     = 4;
 static const int    CALIB_M     = 4;
 static const int    SEED_CHECK_N = 8;
@@ -130,6 +158,20 @@ struct PerOpTimes {
     double mul_ct_s = 0;
     double mul_pt_s = 0;
     double add_ct_s = 0;
+};
+
+// A5: per-backend memory breakdown (model-based, not runtime-tracked)
+struct MemStats {
+    int layout_cts       = 0;  // input CTs holding data before computation
+    int work_cts         = 0;  // peak scratch CTs alive simultaneously
+    int materialized_cts = 0;  // intermediate CTs explicitly stored (tile only)
+    int resident_cts     = 0;  // total in memory at peak = layout + work
+};
+
+// A3: FHE result bundling COUNT and SUM(outer payload) from one pass
+struct FheResult {
+    int64_t count = 0;
+    int64_t sum   = 0;  // SUM(payload[outer_k]) for all matching (outer_k, inner_j)
 };
 
 // ============================================================
@@ -184,22 +226,36 @@ static int64_t plaintext_count(
     return cnt;
 }
 
+// A3: ground-truth SUM(outer_payload[i]) for all matching (OUTER[i], INNER[j]) pairs.
+//     Uses the same orientation that helios_tiling_fhe resolves internally.
+static int64_t plaintext_sum_payload(
+    const std::vector<int64_t>& OUTER,
+    const std::vector<int64_t>& INNER,
+    int delta,
+    const std::vector<int64_t>& outer_payload)
+{
+    int64_t s = 0;
+    for (int i = 0; i < (int)OUTER.size(); i++)
+        for (int j = 0; j < (int)INNER.size(); j++)
+            if (std::abs(OUTER[i] - INNER[j]) <= delta)
+                s += outer_payload[i];
+    return s;
+}
+
 // ============================================================
 //  fhe_between_shifted
 //
 //  Inputs:
-//    ct_shifted_diff  = (A[i] - B[j]) + OFFSET  per slot
-//                     = OUTER+OFFSET - INNER ∈ [1, 127] for valid slots
+//    ct_shifted_diff  = (A[i] - B[j]) + offset_val  per slot
 //
-//  Checks: CMP_LO < ct_shifted_diff < CMP_HI
-//    i.e., 47 < diff < 81
-//    i.e., 48 ≤ diff ≤ 80
-//    i.e., |A[i] - B[j]| ≤ DELTA
+//  Checks: cmp_lo_val < ct_shifted_diff < cmp_hi_val
+//    i.e., for synthetic band: 47 < diff < 81  (|A-B| <= DELTA=16)
+//    i.e., for date band:    3619 < diff < 3681 (|A-B| <= 30 days)
 //
-//  Both bounds (47, 81) are positive — no signed-mod ambiguity.
+//  Both bounds are always positive — no signed-mod ambiguity.
 //
-//  API note: comp.isLessThan(eval, rk, A, B) returns vector<Ciphertext>;
-//  [0] is the boolean indicator.  Adjust if API returns plain Ciphertext.
+//  A4: cmp_lo_val / cmp_hi_val are runtime parameters (default to the
+//      compile-time constants for backward-compatible callers).
 // ============================================================
 static Ciphertext fhe_between_shifted(
     Ciphertext&       ct_shifted_diff,
@@ -208,19 +264,21 @@ static Ciphertext fhe_between_shifted(
     const RelinKeys&  rk,
     BatchEncoder&     benc,
     int               total_slots,
-    OpStats&          ops)
+    OpStats&          ops,
+    int               cmp_lo_val = CMP_LO,  // A4: runtime band lower bound
+    int               cmp_hi_val = CMP_HI)  // A4: runtime band upper bound
 {
-    std::vector<int64_t> lo_vec(total_slots, (int64_t)CMP_LO);
-    std::vector<int64_t> hi_vec(total_slots, (int64_t)CMP_HI);
+    std::vector<int64_t> lo_vec(total_slots, (int64_t)cmp_lo_val);
+    std::vector<int64_t> hi_vec(total_slots, (int64_t)cmp_hi_val);
     Plaintext pt_lo, pt_hi;
     benc.encode(lo_vec, pt_lo);
     benc.encode(hi_vec, pt_hi);
 
-    // mask_lo: CMP_LO < ct_shifted_diff  →  isLessThan(CMP_LO, ct)
+    // mask_lo: cmp_lo_val < ct_shifted_diff  →  isLessThan(cmp_lo_val, ct)
     auto res_lo = comp.isLessThan(eval, rk, pt_lo, ct_shifted_diff);
     ops.he_ltp++;
 
-    // mask_hi: ct_shifted_diff < CMP_HI  →  isLessThan(ct, CMP_HI)
+    // mask_hi: ct_shifted_diff < cmp_hi_val  →  isLessThan(ct, cmp_hi_val)
     auto res_hi = comp.isLessThan(eval, rk, ct_shifted_diff, pt_hi);
     ops.he_ltp++;
 
@@ -485,25 +543,37 @@ static void print_calib(const PerOpTimes& T) {
 }
 
 // ============================================================
-//  HELIOS tiling — actual FHE, two-row packing, global COUNT
+//  HELIOS tiling — actual FHE, two-row packing
+//
+//  Returns FheResult{count, sum} where:
+//    count = global COUNT(*) for band-join predicate
+//    sum   = SUM(outer_payload[k]) for all matching (outer_k, inner_j) pairs
+//            (0 if a_payload/b_payload are both empty — seed-check path)
+//
+//  A3: compute SUM(payload) in the same pass as COUNT.
+//      payload[k] = OUTER_PAYLOAD[k] encoded in same slot layout as outer CT.
+//      ct_contribution = ct_mask * pt_payload; ct_sum += ct_contribution.
+//
+//  A4: offset_val / cmp_lo_val / cmp_hi_val replace compile-time OFFSET/CMP_LO/CMP_HI,
+//      enabling date-band mode without changing the FHE circuit structure.
 //
 //  Shifted encoding:
-//    outer_vec[valid k,j] = OUTER[batch_start+k] + OFFSET
+//    outer_vec[valid k,j] = OUTER[batch_start+k] + offset_val
 //    outer_vec[pad k,j]   = PAD_OUTER = 0
 //    inner_vec[k,j]       = INNER[j]
 //    ct_diff[slot]        = outer[slot] - inner[slot]
-//                         = (A+OFFSET-B) for valid  →  ∈ [1,127]
-//                         = (0 - B)      for pad    →  ≡ large value >> CMP_HI
-//
-//  Comparison: CMP_LO < ct_diff < CMP_HI  (bounds 47,81 — both positive)
+//                         = (A+offset_val-B) for valid  →  ∈ [1, 2*offset_val-1]
+//                         = (0 - B)          for pad    →  ≡ large value >> cmp_hi_val
 //
 //  Both backends (fused=false and fused=true) run the same fused-accumulation
-//  code path.  Difference is only in the reported analytical peak_cts.
+//  code path.  Difference is only in the reported analytical peak_cts (A5).
 // ============================================================
-static int64_t helios_tiling_fhe(
+static FheResult helios_tiling_fhe(
     int n_b, int m_b,
     const std::vector<int64_t>& A,
     const std::vector<int64_t>& B,
+    const std::vector<int64_t>& a_payload,  // A3: payload for A records
+    const std::vector<int64_t>& b_payload,  // A3: payload for B records
     Comparator&       comp,
     Evaluator&        eval,
     Encryptor&        encryptor,
@@ -515,7 +585,10 @@ static int64_t helios_tiling_fhe(
     int               total_slots,
     OpStats&          ops,
     bool              /*fused*/,   // same execution; only affects peak_cts reporting
-    double&           wall_s)
+    double&           wall_s,
+    int               offset_val  = OFFSET,   // A4: runtime shift (OFFSET or DATE_OFFSET)
+    int               cmp_lo_val  = CMP_LO,   // A4: runtime lower bound
+    int               cmp_hi_val  = CMP_HI)   // A4: runtime upper bound
 {
     // Orientation: minimise comparison count
     auto cmp_count_f = [&](int outer, int inner) -> int {
@@ -529,10 +602,14 @@ static int64_t helios_tiling_fhe(
     const std::vector<int64_t>& OUTER = swap_orient ? B : A;
     const std::vector<int64_t>& INNER = swap_orient ? A : B;
 
+    // A3: select payload matching the resolved outer orientation
+    bool compute_sum = (!a_payload.empty() && !b_payload.empty());
+    const std::vector<int64_t>& OUTER_PAYLOAD = swap_orient ? b_payload : a_payload;
+
     if (inner_m > row_slots) {
         std::cerr << "  ERROR: inner_m=" << inner_m << " > row_slots=" << row_slots
                   << "; chunked inner not implemented.\n";
-        return -1;
+        return {-1, 0};
     }
 
     int p_per_row = row_slots / inner_m;    // floor(16384/1028) = 15
@@ -562,6 +639,10 @@ static int64_t helios_tiling_fhe(
     Ciphertext ct_acc;
     bool acc_ready = false;
 
+    // A3: accumulator for SUM(payload)
+    Ciphertext ct_sum;
+    bool sum_acc_ready = false;
+
     for (int batch = 0; batch < n_batches; batch++) {
         int batch_start = batch * p;
         int batch_end   = std::min(batch_start + p, outer_n);
@@ -569,31 +650,34 @@ static int64_t helios_tiling_fhe(
         int this_p0     = std::min(this_p, p_per_row);
         int this_p1     = std::max(0, this_p - p_per_row);
 
-        // Outer CT:  valid positions = OUTER[batch_start+k] + OFFSET
+        // Outer CT:  valid positions = OUTER[batch_start+k] + offset_val  (A4: runtime offset)
         //            pad  positions  = PAD_OUTER = 0
-        // Padding diff = 0 - INNER[j] = -(INNER[j]) mod p ≈ 65537-INNER[j] >> CMP_HI
+        // Padding diff = 0 - INNER[j] = -(INNER[j]) mod p ≈ 65537-INNER[j] >> cmp_hi_val
         std::vector<int64_t> outer_vec(total_slots, (int64_t)PAD_OUTER);
         for (int k = 0; k < this_p0; k++)
             for (int j = 0; j < inner_m; j++)
-                outer_vec[k * inner_m + j] = OUTER[batch_start + k] + OFFSET;
+                outer_vec[k * inner_m + j] =
+                    OUTER[batch_start + k] + (int64_t)offset_val;  // A4
         for (int k = 0; k < this_p1; k++)
             for (int j = 0; j < inner_m; j++)
                 outer_vec[row_slots + k * inner_m + j] =
-                    OUTER[batch_start + p_per_row + k] + OFFSET;
+                    OUTER[batch_start + p_per_row + k] + (int64_t)offset_val;  // A4
 
         Plaintext  pt_outer; benc.encode(outer_vec, pt_outer);
         Ciphertext ct_outer; encryptor.encrypt(pt_outer, ct_outer);
 
-        // ct_diff = (OUTER+OFFSET - INNER)  for valid slots
-        //         = (0 - INNER)             for pad slots
+        // ct_diff = (OUTER+offset_val - INNER)  for valid slots
+        //         = (0 - INNER)                 for pad slots
         Ciphertext ct_diff;
         eval.sub(ct_outer, ct_inner, ct_diff);
         ops.he_sub_ct++;
 
-        // Slot-wise BETWEEN with shifted bounds (no negative plaintexts)
+        // Slot-wise BETWEEN with (runtime) shifted bounds — A4: passes cmp_lo/hi_val
         Ciphertext ct_mask = fhe_between_shifted(
-            ct_diff, comp, eval, rk, benc, total_slots, ops);
+            ct_diff, comp, eval, rk, benc, total_slots, ops,
+            cmp_lo_val, cmp_hi_val);  // A4
 
+        // COUNT accumulation
         if (!acc_ready) {
             ct_acc    = ct_mask;
             acc_ready = true;
@@ -601,10 +685,42 @@ static int64_t helios_tiling_fhe(
             eval.add_inplace(ct_acc, ct_mask);
             ops.he_add_ct++;
         }
+
+        // A3: SUM(payload) accumulation — ct_contribution = mask * payload_plaintext
+        if (compute_sum) {
+            // Build payload plaintext in the same slot layout as outer_vec
+            std::vector<int64_t> payload_vec(total_slots, 0);
+            for (int k = 0; k < this_p0; k++)
+                for (int j = 0; j < inner_m; j++)
+                    payload_vec[k * inner_m + j] =
+                        OUTER_PAYLOAD[batch_start + k];
+            for (int k = 0; k < this_p1; k++)
+                for (int j = 0; j < inner_m; j++)
+                    payload_vec[row_slots + k * inner_m + j] =
+                        OUTER_PAYLOAD[batch_start + p_per_row + k];
+
+            Plaintext  pt_payload; benc.encode(payload_vec, pt_payload);
+            Ciphertext ct_contrib;
+            eval.multiply_plain(ct_mask, pt_payload, ct_contrib);
+            ops.he_mul_pt++;  // A3
+
+            if (!sum_acc_ready) {
+                ct_sum        = ct_contrib;
+                sum_acc_ready = true;
+            } else {
+                eval.add_inplace(ct_sum, ct_contrib);
+                ops.he_add_ct++;
+            }
+        }
+        // end A3
     }
 
     // Reduce both rows to global scalar in slot[0]
     ct_acc = rotation_sum_both_rows(eval, gk, ct_acc, row_slots, ops);
+
+    // A3: also reduce SUM CT to global scalar
+    if (compute_sum && sum_acc_ready)
+        ct_sum = rotation_sum_both_rows(eval, gk, ct_sum, row_slots, ops);
 
     wall_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - t0).count();
@@ -616,16 +732,30 @@ static int64_t helios_tiling_fhe(
     // For large n×m where gt may exceed plain_mod, the returned value is
     // count mod plain_mod (exact comparison not possible without a larger modulus).
     static const int64_t PLAIN_MOD = 65537;
+
     Plaintext pt_result; decryptor.decrypt(ct_acc, pt_result);
     std::vector<int64_t> decoded; benc.decode(pt_result, decoded);
     int64_t raw = decoded[0];
-    return ((raw % PLAIN_MOD) + PLAIN_MOD) % PLAIN_MOD;  // unsigned Z_{plain_mod}
+    int64_t count_val = ((raw % PLAIN_MOD) + PLAIN_MOD) % PLAIN_MOD;
+
+    // A3: decode SUM
+    int64_t sum_val = 0;
+    if (compute_sum && sum_acc_ready) {
+        Plaintext pt_sum; decryptor.decrypt(ct_sum, pt_sum);
+        std::vector<int64_t> dec_sum; benc.decode(pt_sum, dec_sum);
+        int64_t raw_sum = dec_sum[0];
+        sum_val = ((raw_sum % PLAIN_MOD) + PLAIN_MOD) % PLAIN_MOD;
+    }
+
+    return FheResult{count_val, sum_val};
 }
 
 // ============================================================
 //  Multi-seed correctness check
 //  Runs SEED_CHECK_K quick FHE trials (n=8, m=6) with different seeds.
 //  Returns true only if all pass.  Catches comparator boundary bugs early.
+//  Uses synthetic-band mode (default OFFSET/CMP_LO/CMP_HI) regardless of
+//  the outer dateband flag — this tests the core circuit only.
 // ============================================================
 static bool multi_seed_check(
     Comparator& comp, Evaluator& eval,
@@ -637,6 +767,8 @@ static bool multi_seed_check(
 {
     std::cout << "[Correctness] " << n_seeds << " seed(s)"
               << " (n=" << SEED_CHECK_N << " m=" << SEED_CHECK_M << ") ...\n";
+    // A3: empty payload → skip sum computation in seed check
+    const std::vector<int64_t> no_payload;
     int failures = 0;
     for (int seed = 0; seed < n_seeds; seed++) {
         std::cout << "  seed " << (seed + 1) << "/" << n_seeds << " ..." << std::flush;
@@ -648,12 +780,14 @@ static bool multi_seed_check(
         int64_t gt = plaintext_count(A, B, DELTA);
         OpStats ops; ops.reset();
         double wall = 0;
-        int64_t fhe = helios_tiling_fhe(
+        // A3/A4: pass empty payload and default band params
+        FheResult res = helios_tiling_fhe(
             SEED_CHECK_N, SEED_CHECK_M, A, B,
+            no_payload, no_payload,
             comp, eval, encryptor, decryptor, benc, rk, gk,
             row_slots, total_slots, ops, /*fused=*/true, wall);
-        if (fhe != gt) {
-            std::cout << " FAIL (gt=" << gt << " fhe=" << fhe << ")\n";
+        if (res.count != gt) {
+            std::cout << " FAIL (gt=" << gt << " fhe=" << res.count << ")\n";
             std::cout << "    A=["; for (auto v:A) std::cout<<v<<",";
             std::cout << "]\n    B=["; for (auto v:B) std::cout<<v<<",";
             std::cout << "]\n";
@@ -682,6 +816,12 @@ struct BenchResult {
     double      peak_mem_mb   = 0;
     bool        correct       = false;
     bool        ran_actual    = false;
+    // A3: SUM(payload) results
+    int64_t     sum_fhe       = 0;   // FHE-computed sum (mod plain_mod)
+    int64_t     sum_gt        = 0;   // ground-truth sum (mod plain_mod)
+    bool        sum_correct   = false;
+    // A5: detailed memory breakdown
+    MemStats    mem_stats     = {};
 };
 
 static void print_sep(int w = 134) { std::cout << std::string(w, '-') << "\n"; }
@@ -691,7 +831,9 @@ static void write_csv(
     int n_b, int m_b,
     int row_slots, int total_slots,
     double ct_mb,
-    int64_t gt_count)
+    int64_t gt_count,
+    int64_t gt_sum,    // A3
+    bool dateband)     // A4
 {
     std::string path = "./helios_bench_results.csv";
     std::ofstream f(path, std::ios::app);
@@ -699,12 +841,18 @@ static void write_csv(
     // Header on first write (check if file empty)
     f.seekp(0, std::ios::end);
     if (f.tellp() == 0)
-        f << "n_b,m_b,total_slots,row_slots,ct_mb,gt_count,"
+        f << "n_b,m_b,total_slots,row_slots,ct_mb,gt_count,dateband,"
           << "backend,cmp_tot,he_rot,he_mul_ct,he_mul_pt,he_add_ct,he_sub_ct,"
-          << "wall_actual_s,wall_extrap_s,peak_cts,peak_mem_mb,correct\n";
+          << "wall_actual_s,wall_extrap_s,peak_cts,peak_mem_mb,correct,"
+          // A3
+          << "sum_fhe,sum_gt,"
+          // A5
+          << "layout_cts,work_cts,mat_cts,resident_cts\n";
     for (const auto& r : R) {
         f << n_b << "," << m_b << "," << total_slots << "," << row_slots << ","
-          << std::fixed << std::setprecision(2) << ct_mb << "," << gt_count << ","
+          << std::fixed << std::setprecision(2) << ct_mb << ","
+          << gt_count << ","
+          << (dateband ? "date" : "synth") << ","    // A4
           << "\"" << r.name << "\","
           << r.ops.total_cmp() << ","
           << r.ops.he_rot << ","
@@ -716,7 +864,14 @@ static void write_csv(
           << r.wall_extrap_s << ","
           << r.peak_cts << ","
           << std::setprecision(2) << r.peak_mem_mb << ","
-          << (r.ran_actual ? (r.correct ? "PASS" : "FAIL") : "analytic")
+          << (r.ran_actual ? (r.correct ? "PASS" : "FAIL") : "analytic") << ","
+          // A3: sum_gt stored as gt_sum%PM for all backends; always output mod-reduced
+          << r.sum_fhe << "," << r.sum_gt << ","
+          // A5
+          << r.mem_stats.layout_cts << ","
+          << r.mem_stats.work_cts << ","
+          << r.mem_stats.materialized_cts << ","
+          << r.mem_stats.resident_cts
           << "\n";
     }
     std::cout << "  CSV appended to " << path << "\n\n";
@@ -726,8 +881,11 @@ static void print_results(
     const std::vector<BenchResult>& R,
     int n_b, int m_b,
     int64_t gt_count,
+    int64_t gt_sum,     // A3
     int row_slots, int total_slots,
-    double ct_mb)
+    double ct_mb,
+    bool dateband,      // A4
+    int active_delta)   // A4
 {
     double naive_cmp = R.empty() ? 1.0 :
         (double)std::max((int64_t)1, R[0].ops.total_cmp());
@@ -735,8 +893,10 @@ static void print_results(
     std::cout << "\n" << std::string(134, '=') << "\n";
     std::cout << "  HELIOS Bench  n_b=" << n_b << "  m_b=" << m_b
               << "  row_slots=" << row_slots << "  total_slots=" << total_slots
-              << "  Delta=" << DELTA << "  OFFSET=" << OFFSET
+              << "  Delta=" << active_delta                       // A4: show active delta
+              << (dateband ? "  [DATE-BAND]" : "  [SYNTHETIC]") // A4: mode indicator
               << "  gt=" << gt_count
+              << "  gt_sum=" << gt_sum                           // A3
               << "  ct=" << std::fixed << std::setprecision(2) << ct_mb << " MB\n";
     std::cout << std::string(134, '=') << "\n";
 
@@ -804,6 +964,63 @@ static void print_results(
     }
     print_sep();
 
+    // A3: SUM(payload) results section
+    std::cout << "\n[SUM(payload) Results]   A3 — outer payload[k] = (k % " << PAYLOAD_BOUND << ") + 1\n";
+    print_sep(134);
+    std::cout << std::left  << std::setw(24) << "Backend"
+              << std::right
+              << std::setw(20) << "SUM_FHE"
+              << std::setw(20) << "SUM_GT(mod)"
+              << std::setw(12) << "SUM OK?"
+              << "\n";
+    print_sep(134);
+    static const int64_t PM_PRINT = 65537;
+    for (const auto& r : R) {
+        if (!r.ran_actual) {
+            std::cout << std::left  << std::setw(24) << (r.name + " (A)")
+                      << std::right
+                      << std::setw(20) << "-"
+                      << std::setw(20) << gt_sum % PM_PRINT
+                      << std::setw(12) << "(analytic)"
+                      << "\n";
+        } else {
+            std::string s_ok = r.sum_correct ? "PASS" : "FAIL";
+            std::cout << std::left  << std::setw(24) << r.name
+                      << std::right
+                      << std::setw(20) << r.sum_fhe
+                      << std::setw(20) << (gt_sum % PM_PRINT)
+                      << std::setw(12) << s_ok
+                      << "\n";
+        }
+    }
+    print_sep(134);
+
+    // A5: Memory breakdown section
+    std::cout << "\n[Memory Breakdown]   A5 — analytical model (all values in CTs)\n";
+    print_sep(134);
+    std::cout << std::left  << std::setw(24) << "Backend"
+              << std::right
+              << std::setw(14) << "layout_cts"
+              << std::setw(14) << "work_cts"
+              << std::setw(16) << "mat_cts"
+              << std::setw(16) << "resident_cts"
+              << std::setw(14) << "resident_MB"
+              << "\n";
+    print_sep(134);
+    for (const auto& r : R) {
+        const auto& m = r.mem_stats;
+        std::cout << std::left  << std::setw(24) << r.name
+                  << std::right
+                  << std::setw(14) << m.layout_cts
+                  << std::setw(14) << m.work_cts
+                  << std::setw(16) << m.materialized_cts
+                  << std::setw(16) << m.resident_cts
+                  << std::setw(14) << std::fixed << std::setprecision(1)
+                  << (m.resident_cts * ct_mb)
+                  << "\n";
+    }
+    print_sep(134);
+
     std::cout << "\n[Decision Gate]\n";
     if (R.size() >= 3) {
         double sp = naive_cmp / (double)std::max((int64_t)1, R[2].ops.total_cmp());
@@ -841,15 +1058,17 @@ int main(int argc, char* argv[])
     // Flush every write immediately so progress shows through tee/pipes on Linux.
     std::cout.setf(std::ios::unitbuf);
 
-    int  N_B     = 1974;
-    int  M_B     = 1028;
-    bool quick   = false;
-    bool recalib = false;  // force fresh calibration (ignores cache)
+    int  N_B      = 1974;
+    int  M_B      = 1028;
+    bool quick    = false;
+    bool recalib  = false;   // force fresh calibration (ignores cache)
+    bool dateband = false;   // A4: use date-band residual instead of synthetic band
 
     int pos_arg = 0;
     for (int i = 1; i < argc; i++) {
-        if      (std::strcmp(argv[i], "quick")   == 0) quick   = true;
-        else if (std::strcmp(argv[i], "recalib") == 0) recalib = true;
+        if      (std::strcmp(argv[i], "quick")    == 0) quick    = true;
+        else if (std::strcmp(argv[i], "recalib")  == 0) recalib  = true;
+        else if (std::strcmp(argv[i], "dateband") == 0) dateband = true;  // A4
         else if (std::isdigit((unsigned char)argv[i][0])) {
             if      (pos_arg == 0) N_B = std::atoi(argv[i]);
             else if (pos_arg == 1) M_B = std::atoi(argv[i]);
@@ -858,9 +1077,19 @@ int main(int argc, char* argv[])
     }
     if (quick) { N_B = SEED_CHECK_N; M_B = SEED_CHECK_M; }
 
+    // A4: select active band parameters based on mode
+    int active_offset = dateband ? DATE_OFFSET : OFFSET;
+    int active_cmp_lo = dateband ? DATE_CMP_LO : CMP_LO;
+    int active_cmp_hi = dateband ? DATE_CMP_HI : CMP_HI;
+    int active_delta  = dateband ? DELTA_DAYS  : DELTA;
+
     std::cout << "\n" << std::string(134, '=') << "\n";
     std::cout << "  HELIOS FHE Performance Gate  n_b=" << N_B << "  m_b=" << M_B
-              << "  OFFSET=" << OFFSET << "  CMP_LO=" << CMP_LO << "  CMP_HI=" << CMP_HI << "\n";
+              << "  OFFSET=" << active_offset
+              << "  CMP_LO=" << active_cmp_lo
+              << "  CMP_HI=" << active_cmp_hi
+              << (dateband ? "  [DATE-BAND mode]" : "  [SYNTHETIC mode]")  // A4
+              << "\n";
     std::cout << std::string(134, '=') << "\n\n";
 
     // ---- BFV setup -------------------------------------------------------
@@ -959,31 +1188,116 @@ int main(int argc, char* argv[])
               << std::fixed << std::setprecision(1)
               << (double)naive_cmp_d / (double)(2*nb_d) << "x\n\n";
 
-    // ---- Synthetic data --------------------------------------------------
-    std::mt19937_64 rng(42);
-    std::uniform_int_distribution<int64_t> dist(0, VALUE_RANGE - 1);
+    // ---- Data generation -------------------------------------------------
+    // A4: date-band mode uses deterministic day-offset values instead of random.
     std::vector<int64_t> A(N_B), B(M_B);
-    for (auto& v : A) v = dist(rng);
-    for (auto& v : B) v = dist(rng);
+    if (dateband) {
+        // A4: synthetic but realistic date distribution (days-since-epoch)
+        for (int i = 0; i < N_B; i++)
+            A[i] = BASE_DATE + (int64_t)(i * 7)  % DATE_RANGE;
+        for (int j = 0; j < M_B; j++)
+            B[j] = BASE_DATE + (int64_t)(j * 11) % DATE_RANGE;
+        std::cout << "[Data] DATE-BAND mode  n_b=" << N_B << "  m_b=" << M_B
+                  << "  BASE_DATE=" << BASE_DATE
+                  << "  DATE_RANGE=" << DATE_RANGE
+                  << "  DELTA_DAYS=" << DELTA_DAYS << "\n";
+    } else {
+        std::mt19937_64 rng(42);
+        std::uniform_int_distribution<int64_t> dist(0, VALUE_RANGE - 1);
+        for (auto& v : A) v = dist(rng);
+        for (auto& v : B) v = dist(rng);
+    }
 
-    int64_t gt_count = plaintext_count(A, B, DELTA);
-    std::cout << "[Data] n_b=" << N_B << "  m_b=" << M_B
-              << "  gt_count=" << gt_count
-              << "  (" << std::fixed << std::setprecision(1)
-              << 100.0 * gt_count / ((int64_t)N_B * M_B) << "% match)\n\n";
+    int64_t gt_count = plaintext_count(A, B, active_delta);
+
+    // A3: synthetic payloads — outer_payload[k] = (k % PAYLOAD_BOUND) + 1
+    //     Generate for both A and B; helios_tiling_fhe selects the right one
+    //     based on its internal swap_orient decision.
+    std::vector<int64_t> a_payload(N_B), b_payload(M_B);
+    for (int i = 0; i < N_B; i++) a_payload[i] = (int64_t)(i % PAYLOAD_BOUND) + 1;
+    for (int j = 0; j < M_B; j++) b_payload[j] = (int64_t)(j % PAYLOAD_BOUND) + 1;
+
+    // A3: ground-truth SUM — replicate helios_tiling_fhe's swap_orient decision
+    //     so we compute SUM of the same payload set as the FHE circuit uses.
+    auto orient_cmp = [&](int outer, int inner) -> int {
+        if (inner > row_slots) return INT_MAX;
+        return ceildiv(outer, 2 * (row_slots / inner));
+    };
+    bool will_swap = (orient_cmp(M_B, N_B) < orient_cmp(N_B, M_B));
+    const std::vector<int64_t>& OUTER_GT    = will_swap ? B : A;
+    const std::vector<int64_t>& INNER_GT    = will_swap ? A : B;
+    const std::vector<int64_t>& OUTER_PAY_GT = will_swap ? b_payload : a_payload;
+    int64_t gt_sum = plaintext_sum_payload(OUTER_GT, INNER_GT, active_delta, OUTER_PAY_GT);
+
+    if (!dateband) {
+        std::cout << "[Data] n_b=" << N_B << "  m_b=" << M_B
+                  << "  gt_count=" << gt_count
+                  << "  gt_sum=" << gt_sum
+                  << "  (" << std::fixed << std::setprecision(1)
+                  << 100.0 * gt_count / ((int64_t)N_B * M_B) << "% match)\n\n";
+    } else {
+        std::cout << "  gt_count=" << gt_count
+                  << "  gt_sum=" << gt_sum
+                  << "  (" << std::fixed << std::setprecision(1)
+                  << 100.0 * gt_count / ((int64_t)N_B * M_B) << "% match)\n\n";
+    }
+
+    // A5: analytical memory breakdown for each backend
+    //
+    // Formulas (model-based; see paper §Memory):
+    //   Naive:        layout = N_B + ceil(M_B/S),  work = 6, mat = 0
+    //   FixedOrient:  layout = min + ceil(max/S),  work = 6, mat = 0
+    //   HELIOS-Fused: layout = 1 + n_batches,      work = 6, mat = 0
+    //   HELIOS-Tile:  layout = 1 + n_batches,      work = 6 + n_batches, mat = n_batches
+    //
+    // resident = layout + work for all backends.
+    MemStats mem_naive, mem_fixed, mem_tile, mem_fused;
+    {
+        // Naive: outer=N_B (no orientation swap), inner=M_B
+        mem_naive.layout_cts       = N_B + ceildiv(M_B, total_slots);
+        mem_naive.work_cts         = 6;
+        mem_naive.materialized_cts = 0;
+        mem_naive.resident_cts     = mem_naive.layout_cts + mem_naive.work_cts;
+
+        // FixedOrient: outer=min(N_B,M_B), inner=max(N_B,M_B)
+        mem_fixed.layout_cts       = std::min(N_B,M_B) + ceildiv(std::max(N_B,M_B), total_slots);
+        mem_fixed.work_cts         = 6;
+        mem_fixed.materialized_cts = 0;
+        mem_fixed.resident_cts     = mem_fixed.layout_cts + mem_fixed.work_cts;
+
+        // HELIOS shared geometry (matches helios_tiling_fhe's swap_orient)
+        int h_outer_n = will_swap ? M_B : N_B;
+        int h_inner_m = will_swap ? N_B : M_B;
+        int h_p       = 2 * (row_slots / h_inner_m);
+        int h_nb      = ceildiv(h_outer_n, h_p);
+
+        // HELIOS-Tile: materialized tile grid = n_batches extra work CTs
+        mem_tile.layout_cts        = 1 + h_nb;
+        mem_tile.work_cts          = 6 + h_nb;
+        mem_tile.materialized_cts  = h_nb;
+        mem_tile.resident_cts      = mem_tile.layout_cts + mem_tile.work_cts;
+
+        // HELIOS-Fused: O(1) scratch (running accumulator only)
+        mem_fused.layout_cts       = 1 + h_nb;
+        mem_fused.work_cts         = 6;
+        mem_fused.materialized_cts = 0;
+        mem_fused.resident_cts     = mem_fused.layout_cts + mem_fused.work_cts;
+    }
 
     std::vector<BenchResult> results;
+    static const int64_t PM = 65537;  // plaintext modulus
 
     // Backend 1: Naive (analytical)
     {
         std::cout << "[Backend 1] Naive (analytical) ...\n";
         OpStats ops = count_naive(N_B, M_B, total_slots);
         double  ext = extrapolate_s(ops, T);
-        int64_t pk  = 1 + ceildiv(M_B, total_slots) + 4;
+        int64_t pk  = (int64_t)mem_naive.resident_cts;
         std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
                   << "  extrap=" << std::fixed << std::setprecision(0)
                   << ext << "s (~" << ext/3600 << "h)\n\n";
-        results.push_back({"1-Naive", ops, 0, ext, pk, pk*ct_mb, true, false});
+        results.push_back({"1-Naive", ops, 0, ext, pk, pk*ct_mb, true, false,
+                            0, gt_sum % PM, false, mem_naive});
     }
 
     // Backend 2: Fixed orientation (analytical)
@@ -991,11 +1305,12 @@ int main(int argc, char* argv[])
         std::cout << "[Backend 2] FixedOrient (analytical) ...\n";
         OpStats ops = count_fixed(N_B, M_B, total_slots);
         double  ext = extrapolate_s(ops, T);
-        int64_t pk  = 1 + ceildiv(std::max(N_B, M_B), total_slots) + 4;
+        int64_t pk  = (int64_t)mem_fixed.resident_cts;
         std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
                   << "  extrap=" << std::fixed << std::setprecision(0)
                   << ext << "s (~" << ext/3600 << "h)\n\n";
-        results.push_back({"2-FixedOrient", ops, 0, ext, pk, pk*ct_mb, true, false});
+        results.push_back({"2-FixedOrient", ops, 0, ext, pk, pk*ct_mb, true, false,
+                            0, gt_sum % PM, false, mem_fixed});
     }
 
     // Backend 3: HELIOS tile (non-fused memory model; fused execution)
@@ -1003,23 +1318,28 @@ int main(int argc, char* argv[])
         std::cout << "[Backend 3] HELIOS-Tile (actual FHE; non-fused peak_cts model) ...\n";
         OpStats ops; ops.reset();
         double wall = 0;
-        int64_t fhe_count = helios_tiling_fhe(
-            N_B, M_B, A, B, comparator, evaluator, encryptor, decryptor,
-            benc, rlk, gk, row_slots, total_slots, ops, /*fused=*/false, wall);
-        // fhe_count is in [0, 65536] (unsigned Z_{65537}).
-        // Compare mod plain_mod: exact when gt < 65537; modular check otherwise.
-        static const int64_t PM = 65537;
-        bool ok = (fhe_count == gt_count % PM);
-        int  p3 = 2 * (row_slots / std::min(N_B, M_B));
-        int  nb3= ceildiv(std::max(N_B, M_B), p3);
-        int64_t pk = (int64_t)nb3 + 2 + 4;
-        double ext = extrapolate_s(ops, T);
+        // A3/A4: pass payloads and active band params
+        FheResult fhe3 = helios_tiling_fhe(
+            N_B, M_B, A, B,
+            a_payload, b_payload,
+            comparator, evaluator, encryptor, decryptor,
+            benc, rlk, gk, row_slots, total_slots, ops, /*fused=*/false, wall,
+            active_offset, active_cmp_lo, active_cmp_hi);
+        bool ok3      = (fhe3.count == gt_count % PM);
+        bool sum_ok3  = (fhe3.sum   == gt_sum   % PM);  // A3
+        int64_t pk    = (int64_t)mem_tile.resident_cts;
+        double ext    = extrapolate_s(ops, T);
         std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
                   << "  wall=" << std::fixed << std::setprecision(1) << wall << "s"
-                  << "  fhe=" << fhe_count
-                  << " gt=" << gt_count << " (mod=" << gt_count % PM << ")"
-                  << "  " << (ok ? "PASS" : "FAIL") << "\n\n";
-        results.push_back({"3-HELIOS-Tile", ops, wall, ext, pk, pk*ct_mb, ok, true});
+                  << "  fhe_count=" << fhe3.count
+                  << " gt_count=" << gt_count << " (mod=" << gt_count % PM << ")"
+                  << "  " << (ok3 ? "PASS" : "FAIL")
+                  << "  fhe_sum=" << fhe3.sum                          // A3
+                  << " gt_sum(mod)=" << gt_sum % PM                   // A3
+                  << "  sum:" << (sum_ok3 ? "PASS" : "FAIL")          // A3
+                  << "\n\n";
+        results.push_back({"3-HELIOS-Tile", ops, wall, ext, pk, pk*ct_mb, ok3, true,
+                            fhe3.sum, gt_sum % PM, sum_ok3, mem_tile});
     }
 
     // Backend 4: HELIOS fused (fused memory model; same execution)
@@ -1027,22 +1347,33 @@ int main(int argc, char* argv[])
         std::cout << "[Backend 4] HELIOS-Fused (actual FHE; O(1) peak_cts model) ...\n";
         OpStats ops; ops.reset();
         double wall = 0;
-        int64_t fhe_count = helios_tiling_fhe(
-            N_B, M_B, A, B, comparator, evaluator, encryptor, decryptor,
-            benc, rlk, gk, row_slots, total_slots, ops, /*fused=*/true, wall);
-        static const int64_t PM4 = 65537;
-        bool ok = (fhe_count == gt_count % PM4);
-        int64_t pk = 2 + 4;
-        double ext = extrapolate_s(ops, T);
+        // A3/A4: pass payloads and active band params
+        FheResult fhe4 = helios_tiling_fhe(
+            N_B, M_B, A, B,
+            a_payload, b_payload,
+            comparator, evaluator, encryptor, decryptor,
+            benc, rlk, gk, row_slots, total_slots, ops, /*fused=*/true, wall,
+            active_offset, active_cmp_lo, active_cmp_hi);
+        bool ok4      = (fhe4.count == gt_count % PM);
+        bool sum_ok4  = (fhe4.sum   == gt_sum   % PM);  // A3
+        int64_t pk    = (int64_t)mem_fused.resident_cts;
+        double ext    = extrapolate_s(ops, T);
         std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
                   << "  wall=" << std::fixed << std::setprecision(1) << wall << "s"
-                  << "  fhe=" << fhe_count
-                  << " gt=" << gt_count << " (mod=" << gt_count % PM4 << ")"
-                  << "  " << (ok ? "PASS" : "FAIL") << "\n\n";
-        results.push_back({"4-HELIOS-Fused", ops, wall, ext, pk, pk*ct_mb, ok, true});
+                  << "  fhe_count=" << fhe4.count
+                  << " gt_count=" << gt_count << " (mod=" << gt_count % PM << ")"
+                  << "  " << (ok4 ? "PASS" : "FAIL")
+                  << "  fhe_sum=" << fhe4.sum                          // A3
+                  << " gt_sum(mod)=" << gt_sum % PM                   // A3
+                  << "  sum:" << (sum_ok4 ? "PASS" : "FAIL")          // A3
+                  << "\n\n";
+        results.push_back({"4-HELIOS-Fused", ops, wall, ext, pk, pk*ct_mb, ok4, true,
+                            fhe4.sum, gt_sum % PM, sum_ok4, mem_fused});
     }
 
-    print_results(results, N_B, M_B, gt_count, row_slots, total_slots, ct_mb);
-    write_csv(results, N_B, M_B, row_slots, total_slots, ct_mb, gt_count);
+    print_results(results, N_B, M_B, gt_count, gt_sum,
+                  row_slots, total_slots, ct_mb, dateband, active_delta);
+    write_csv(results, N_B, M_B, row_slots, total_slots, ct_mb,
+              gt_count, gt_sum, dateband);
     return 0;
 }
