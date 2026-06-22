@@ -1,0 +1,73 @@
+
+======================================================================================================================================
+  HELIOS FHE Performance Gate  n_b=512  m_b=256  OFFSET=64  CMP_LO=47  CMP_HI=81
+======================================================================================================================================
+
+[Setup] Generating BFV keys ...
+  Done (100.5s)  total_slots=32768  row_slots=16384
+  CT size (serialized): 7405152 bytes  (7.41 MB)
+
+[Calibration]
+  Loaded from ./helios_calib.txt  (pass 'recalib' to remeasure)
+    isLessThan(ct,pt): 174.973 s
+    rotate_rows:       111.915 ms
+    mul_ct + relin:    351.768 ms
+    mul_pt:            1.065 ms
+    add_ct:            702.634 us
+
+[Tiling — Bucket C]
+  inner_m=256  p_per_row=64  p=128  n_batches=4
+  HELIOS CMP: 2 * 4 = 8
+  Naive   CMP: 2 * 512 = 1024
+  Expected reduction: ~128.0x
+
+[Data] n_b=512  m_b=256  gt_count=60937  (46.5% match)
+
+[Backend 1] Naive (analytical) ...
+  CMP=1024  ROT=12800  extrap=180794s (~50h)
+
+[Backend 2] FixedOrient (analytical) ...
+  CMP=512  ROT=6656  extrap=90426s (~25h)
+
+[Backend 3] HELIOS-Tile (actual FHE; non-fused peak_cts model) ...
+  CMP=8  ROT=15  wall=1292.1s  fhe=60937 gt=60937 (mod=60937)  PASS
+
+[Backend 4] HELIOS-Fused (actual FHE; O(1) peak_cts model) ...
+  CMP=8  ROT=15  wall=1291.9s  fhe=60937 gt=60937 (mod=60937)  PASS
+
+
+======================================================================================================================================
+  HELIOS Bench  n_b=512  m_b=256  row_slots=16384  total_slots=32768  Delta=16  OFFSET=64  gt=60937  ct=7.41 MB
+======================================================================================================================================
+
+[HE Operation Counts]   (A) = analytical; no FHE executed
+--------------------------------------------------------------------------------------------------------------------------------------
+Backend                       LT      EQ     ROT   MULct   MULpt   ADDct   SUBct       CMP   Reduction
+--------------------------------------------------------------------------------------------------------------------------------------
+1-Naive (A)                 1024       0   12800     512     512   12800       0      1024        1.0x
+2-FixedOrient (A)            512       0    6656     256     256    6656       0       512        2.0x
+3-HELIOS-Tile                  8       0      15       4       0      18       4         8      128.0x
+4-HELIOS-Fused                 8       0      15       4       0      18       4         8      128.0x
+--------------------------------------------------------------------------------------------------------------------------------------
+
+[Wall Time & Memory]   Backend 3+4 share same exec path; peak_cts differs analytically
+--------------------------------------------------------------------------------------------------------------------------------------
+Backend                       WallActual      WallExtrap     PeakCTs   PeakMem(MB)    Correct?
+--------------------------------------------------------------------------------------------------------------------------------------
+1-Naive                                -           50.2h           6          44.4  (analytic)
+2-FixedOrient                          -           25.1h           6          44.4  (analytic)
+3-HELIOS-Tile                      21.5m           23.4m          10          74.1        PASS
+4-HELIOS-Fused                     21.5m           23.4m           6          44.4        PASS
+--------------------------------------------------------------------------------------------------------------------------------------
+
+[Decision Gate]
+  CMP reduction (Naive vs HELIOS):  128.0x
+  Naive extrap:    180794s  (~50.22h)
+  HELIOS actual:   1292.07s
+  Backend 3 peak:  10 CTs  (74.1 MB)
+  Backend 4 peak:  6 CTs  (44.4 MB)  [O(1) fused model]
+  Verdict: STRONG (>=20x)
+======================================================================================================================================
+
+  CSV appended to ./helios_bench_results.csv
+

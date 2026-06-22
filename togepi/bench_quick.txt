@@ -1,0 +1,14 @@
+
+======================================================================================================================================
+  HELIOS FHE Performance Gate  n_b=8  m_b=6  OFFSET=64  CMP_LO=47  CMP_HI=81
+======================================================================================================================================
+
+[Setup] Generating BFV keys ...
+  Done (102.5s)  total_slots=32768  row_slots=16384
+  CT size (serialized): 7404935 bytes  (7.40 MB)
+
+[Correctness] 1 seed(s) (n=8 m=6) ...
+  seed 1/1 ... PASS  (323.2s  gt=19)
+  ALL PASS (1/1 seeds correct)
+
+Quick mode: 1-seed check passed. Exiting.
