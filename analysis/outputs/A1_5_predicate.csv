@@ -1,0 +1,4 @@
+predicate,delta_days,n_buckets,pct_buckets,tiny_pairs,n_tiny_cts,n_large_buckets,cost_hrs
+tight (Δ=14d),14,64942,30.0%,80189344,2448,2107,1355.4
+medium (Δ=30d),30,86286,39.9%,108246484,3304,2712,1783.6
+wide (Δ=90d),90,64969,30.1%,81466126,2487,1998,1339.6

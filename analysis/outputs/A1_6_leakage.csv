@@ -1,0 +1,4 @@
+level,block_width_days,n_blocks,n_per_block,work_per_block,regime,cost_hrs,leakage_metric,recall_loss
+no blocking,3650,1,100000,10000000000,HELIOS-tile (large),4884.4,1,0.0164
+weekly,7,521,192,36780,HELIOS-tile (large),101.8,521,1.0
+daily,1,3650,27,751,co-pack (tiny),8.2,3650,1.0

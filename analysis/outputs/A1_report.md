@@ -1,14 +1,13 @@
 # HELIOS A1 — Cost-Surface Sweep: NC Voter Band Join
 
-**Generated:** 2026-06-22 15:06
+**Generated:** 2026-06-23 02:01
 **Task:** Demonstrate non-monotonicity of HELIOS cost vs. blocking granularity
 **Dataset:** NC statewide voter registration (~8 M rows)
 **Band-join predicate:** |A.reg_date − B.reg_date| ≤ Δ
 
 ---
 
-> **Data source: ZIPF APPROXIMATION** (real per-bucket CSVs not yet available).
-These results are preliminary; run `helios_run2_feasibility.py` on togepi (where `/tmp/ncvoter_Statewide.zip` is cached) and copy the resulting `buckets_*.csv` files to `/Users/ballb/Documents/Claude/Projects/`, then re-run this script for the definitive analysis.
+> **Data source: REAL per-bucket distributions from NC voter registration file (~8 M rows).** All numbers below reflect actual bucket size distributions.
 
 ---
 
@@ -24,9 +23,9 @@ These results are preliminary; run `helios_run2_feasibility.py` on togepi (where
 
 ## Data Sources
 
-  - **coarse**: Zipf approx (γ=0.239)
-  - **medium**: Zipf approx (γ=0.531)
-  - **fine**: Zipf approx (γ=0.523)
+  - **coarse**: real NC voter data
+  - **medium**: real NC voter data
+  - **fine**: real NC voter data
 
 ---
 
@@ -44,24 +43,24 @@ These results are preliminary; run `helios_run2_feasibility.py` on togepi (where
 
 | Granularity | Buckets | Total CMPs | HELIOS (s) | HELIOS (hrs) | Naive (hrs) | Speedup |
 |-------------|--------:|-----------:|-----------:|-------------:|------------:|--------:|
-| coarse   |        110 | 11,211,140 |  1.971e+09 |     547601.9 |   2236004.9 |     4.1× |
-| medium   |    216,197 |    440,636 |  7.748e+07 |      21522.6 |   2163388.1 |   100.5× |
-| fine     |  1,380,527 |  2,761,058 |  4.855e+08 |     134862.3 |   1521356.5 |    11.3× |
+| coarse   |        110 |  9,107,196 |  1.601e+09 |     444835.9 |   2268861.7 |     5.1× |
+| medium   |    216,197 |    494,024 |  8.687e+07 |      24130.3 |    885679.0 |    36.7× |
+| fine     |  1,380,527 |  2,761,104 |  4.855e+08 |     134864.6 |    825286.5 |     6.1× |
 
 **Narrative.** At S=32,768 and calibrated lt_s=175 s:
 
-- **Coarse** has 11,211,140 total CMPs (degenerate regime: every birth-year bucket
+- **Coarse** has 9,107,196 total CMPs (degenerate regime: every birth-year bucket
   has inner_m >> row_slots, so p_per_row=1, CMP≈outer_n). Cost is
-  547,602 hrs — 25.4× worse than medium.
+  444,836 hrs — 18.4× worse than medium.
 
-- **Medium** has 440,636 total CMPs. Most of the 216 K soundex+birth-year
+- **Medium** has 494,024 total CMPs. Most of the 216 K soundex+birth-year
   buckets are tiny (work ≪ 2×row_slots), each paying the floor of 2 CMPs.
   A small top-1% of large buckets contributes above-floor CMPs but is well
-  amortised by HELIOS packing. Total cost: 21,523 hrs.
+  amortised by HELIOS packing. Total cost: 24,130 hrs.
 
-- **Fine** has 2,761,058 total CMPs. The 1.38 M ZIP3+soundex+birth-year buckets
+- **Fine** has 2,761,104 total CMPs. The 1.38 M ZIP3+soundex+birth-year buckets
   are overwhelmingly tiny (avg work≈75), so nearly all pay the CMP floor of 2.
-  Despite lower *total work*, fine costs 6.3× MORE than medium because
+  Despite lower *total work*, fine costs 5.6× MORE than medium because
   it has 6.4× more buckets, each paying the minimum 2 CMPs.
 
 ---
@@ -72,15 +71,15 @@ The HELIOS CMP count is a property of S only (not lt_cost).  Below: total CMPs a
 
 | Granularity | S       | Total CMPs | n_batches | CMP/bucket |
 |-------------|--------:|-----------:|----------:|-----------:|
-| coarse   |   8,192 | 11,211,140 | 5,605,570 |  101919.45 |
-| coarse   |  16,384 | 11,211,140 | 5,605,570 |  101919.45 |
-| coarse   |  32,768 | 11,211,140 | 5,605,570 |  101919.45 |
-| medium   |   8,192 |    546,470 |   273,235 |       2.53 |
-| medium   |  16,384 |    463,090 |   231,545 |       2.14 |
-| medium   |  32,768 |    440,636 |   220,318 |       2.04 |
-| fine     |   8,192 |  2,761,184 | 1,380,592 |       2.00 |
-| fine     |  16,384 |  2,761,084 | 1,380,542 |       2.00 |
-| fine     |  32,768 |  2,761,058 | 1,380,529 |       2.00 |
+| coarse   |   8,192 |  9,148,242 | 4,574,121 |   83165.84 |
+| coarse   |  16,384 |  9,137,460 | 4,568,730 |   83067.82 |
+| coarse   |  32,768 |  9,107,196 | 4,553,598 |   82792.69 |
+| medium   |   8,192 |    740,594 |   370,297 |       3.43 |
+| medium   |  16,384 |    571,654 |   285,827 |       2.64 |
+| medium   |  32,768 |    494,024 |   247,012 |       2.29 |
+| fine     |   8,192 |  2,763,788 | 1,381,894 |       2.00 |
+| fine     |  16,384 |  2,761,552 | 1,380,776 |       2.00 |
+| fine     |  32,768 |  2,761,104 | 1,380,552 |       2.00 |
 
 ---
 

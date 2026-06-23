@@ -80,6 +80,29 @@ echo "[$(ts)]  Quick check PASSED."
 echo
 
 # ----------------------------------------------------------------
+# F1. All-backend measured baseline (32×32)
+#     Runs Naive + FixedOrient + HELIOS-Tile + HELIOS-Fused in real FHE.
+#     Naive CMP=64 → ~3.1 h; HELIOS CMP=2 → ~6 min.
+#     Validates that measured ≈ CMP × lt_s, anchoring the large-bucket
+#     extrapolations (256×512→25h, 512×256→50h, 1974×1028→194h).
+#     Use 'small 16' for a faster run (~1.5 h Naive) or 'small 64' for
+#     a more convincing data point (~12 h Naive).
+# ----------------------------------------------------------------
+hr
+echo "[$(ts)]  F1 all-backend measured baseline (32×32, small mode) ..."
+hr
+
+stdbuf -oL "$BENCH" small 2>&1 | tee "$LOG_DIR/bench_f1_32x32.txt"
+f1_exit=${PIPESTATUS[0]}
+
+if [ "$f1_exit" -ne 0 ]; then
+    echo "ERROR: F1 small run failed (exit $f1_exit). Aborting."
+    exit "$f1_exit"
+fi
+echo "[$(ts)]  F1 run DONE."
+echo
+
+# ----------------------------------------------------------------
 # 1. 256 x 512
 # ----------------------------------------------------------------
 run_bench "256x512" 256 512

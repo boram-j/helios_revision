@@ -1,0 +1,63 @@
+HELIOS A1-6 Gate 0 Analysis
+============================
+Date: run from a1_experiments_6.py
+
+═══════════════════════════════════════════════════════════════
+GATE 0a — Temporal substrate defensibility
+═══════════════════════════════════════════════════════════════
+
+Substrate: SUM(payload) FROM DrugExposure D, MedicalEvent E
+           WHERE candidate(D,E) AND |D.t − E.t| ≤ Δ
+
+Two sentences on why time cannot be a fine public blocking key:
+
+[1] Any band predicate with window Δ that crosses a time-block boundary silently drops those event pairs from the within-block comparison — specifically, records within distance Δ of a block edge miss their cross-block counterparts, creating recall loss proportional to 2Δ / block_width that grows as blocking becomes finer.
+
+[2] Publishing fine-grained time blocks as plaintext blocking keys reveals the temporal event distribution to a passive observer: block presence or absence discloses which time periods contain events (presence leakage), and block cardinalities expose event density at the granularity of the block width — a direct temporal side-channel on the private dataset.
+
+Reviewer acceptability: YES — both concerns are standard in privacy-
+preserving record linkage literature and would satisfy a VLDB reviewer.
+
+Gate 0a: PASS
+
+═══════════════════════════════════════════════════════════════
+GATE 0b — Rotation-key budget physics
+═══════════════════════════════════════════════════════════════
+
+Source: helios_revision/app/helios_bench/helios_bucket_bench.cpp
+        lines 204–212  (needed_galois_steps function)
+
+BFV parameters:
+  poly_modulus_degree N = 32,768
+  row_slots             = N/2 = 16,384
+
+Rotation keys generated:
+  needed_galois_steps() = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+  Total: 15 keys
+
+Key-size physics:
+  coeff_mod ≈ 240 bits (60+40+40+40+60 for N=32,768)
+  bytes per key = 2 × 32,768 × 240/8 = 1,966,080 (1.97 MB)
+  Total 15 keys = 29.5 MB
+
+Shape-independence:
+  The step set is: {0} ∪ {row_slots/2, row_slots/4, ..., 1}
+  It is determined entirely by N (via row_slots = N/2).
+  It does NOT depend on tile shape (p,q) or inner_m.
+  All tile shapes use the SAME 15 Galois keys.
+
+Cross-bucket key tension: NONE.
+
+Alternative (peak-CT ceiling):
+  Backend 4 (fused accumulator) reduces peak CTs to O(1) per bucket
+  by construction; it is not a hardware-binding constraint.
+
+Gate 0b: FAIL
+  Galois keys are shape-independent in BFV row-packing.
+  The hypothesized key-sharing mechanism does not exist.
+  A1-6.2 is degenerate (greedy = global; gap = 0 by construction).
+
+═══════════════════════════════════════════════════════════════
+GATE 0 OVERALL: FAIL (Gate 0b)
+═══════════════════════════════════════════════════════════════
+Proceeding to A1-6.3 (leakage frontier), which is independent of Gate 0b.

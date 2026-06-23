@@ -67,6 +67,10 @@
  *   ./bin/helios_bucket_bench quick          # n=8, m=6, 1-seed check
  *   ./bin/helios_bucket_bench dateband       # A4: date-band residual mode
  *   ./bin/helios_bucket_bench recalib        # force fresh calibration
+ *   ./bin/helios_bucket_bench small          # F1: all 4 backends in real FHE, 32×32 (default)
+ *   ./bin/helios_bucket_bench small 16       # F1:  16×16 (faster; ~1.5 h for Naive)
+ *   ./bin/helios_bucket_bench small 64       # F1:  64×64 (slower; ~12 h for Naive)
+ *   ./bin/helios_bucket_bench f1             # alias for 'small'
  */
 
 #include "nshedb/nshedb.h"
@@ -751,6 +755,174 @@ static FheResult helios_tiling_fhe(
 }
 
 // ============================================================
+//  nested_loop_fhe — actual FHE nested-loop baseline
+//  (Backends 1 "Naive" and 2 "FixedOrient" when measured via 'small' mode)
+//
+//  Processes each outer record independently against ceil(inner_m/total_slots)
+//  chunks of inner records.  This is the NSHEDB-style packed nested-loop made
+//  measurable: one isLessThan-pair per (outer_i, chunk) pair.
+//
+//  Caller resolves orientation before passing OUTER/INNER:
+//    Naive      → OUTER=A (N_B records), INNER=B (M_B records)
+//    FixedOrient→ OUTER=smaller side,    INNER=larger side
+//
+//  Outer values are broadcast as plaintexts (no rotation needed), so the
+//  executed CMP count matches count_naive/count_fixed analytically.
+//
+//  Padding fix: inner_vec slots beyond active inner records are 0.
+//  diff = (outer_i+offset) - 0 = outer_i+offset, which may fall inside
+//  [CMP_LO, CMP_HI] and cause false matches.  We zero-out these slots in
+//  ct_mask via a plaintext selection mask on every partial chunk.
+//  At 16×16, active=16 < total_slots=32768, so masking is always applied.
+//
+//  A3: SUM(OUTER_PAYLOAD) in same pass — ct_reduced holds count for (i,chunk)
+//      in ALL slots after rotation_sum_both_rows; multiply by OUTER_PAYLOAD[i]
+//      and accumulate to get Σ_i payload[i]×#{j: match} = SUM(outer payload).
+//  A4: offset_val/cmp_lo_val/cmp_hi_val replace compile-time constants for
+//      date-band mode.
+// ============================================================
+static FheResult nested_loop_fhe(
+    const std::vector<int64_t>& OUTER,
+    const std::vector<int64_t>& INNER,
+    const std::vector<int64_t>& OUTER_PAYLOAD,
+    bool                        compute_sum,
+    Comparator&       comp,
+    Evaluator&        eval,
+    Encryptor&        encryptor,
+    Decryptor&        decryptor,
+    BatchEncoder&     benc,
+    const RelinKeys&  rk,
+    const GaloisKeys& gk,
+    int               row_slots,
+    int               total_slots,
+    OpStats&          ops,
+    double&           wall_s,
+    int               offset_val = OFFSET,
+    int               cmp_lo_val = CMP_LO,
+    int               cmp_hi_val = CMP_HI)
+{
+    int outer_n = (int)OUTER.size();
+    int inner_m = (int)INNER.size();
+    if (outer_n == 0 || inner_m == 0) { wall_s = 0; return {0, 0}; }
+    int n_chunks = ceildiv(inner_m, total_slots);
+
+    // Pre-encrypt inner chunks (outside timing window, mirrors helios_tiling_fhe)
+    std::vector<Ciphertext> ct_inner_chunks(n_chunks);
+    for (int c = 0; c < n_chunks; c++) {
+        int chunk_start = c * total_slots;
+        int chunk_end   = std::min(chunk_start + total_slots, inner_m);
+        std::vector<int64_t> inner_vec(total_slots, 0);
+        for (int j = chunk_start; j < chunk_end; j++)
+            inner_vec[j - chunk_start] = INNER[j];
+        Plaintext  pt_inner; benc.encode(inner_vec, pt_inner);
+        encryptor.encrypt(pt_inner, ct_inner_chunks[c]);
+    }
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    Ciphertext ct_acc;
+    bool acc_ready     = false;
+    Ciphertext ct_sum_acc;
+    bool sum_acc_ready = false;
+
+    for (int i = 0; i < outer_n; i++) {
+        // Broadcast outer_i + offset to ALL slots as a plaintext constant.
+        // No rotation needed; cost is just encode (negligible vs isLessThan).
+        std::vector<int64_t> outer_bcast(total_slots,
+                                          OUTER[i] + (int64_t)offset_val);
+        Plaintext pt_outer; benc.encode(outer_bcast, pt_outer);
+
+        for (int c = 0; c < n_chunks; c++) {
+            int chunk_start = c * total_slots;
+            int chunk_end   = std::min(chunk_start + total_slots, inner_m);
+            int active      = chunk_end - chunk_start;
+
+            // ct_diff = pt_outer - ct_inner  per slot
+            //         = (outer_i + offset_val) - INNER[j]  for valid slots
+            //         = (outer_i + offset_val) - 0          for padding slots
+            // Computed as: negate(ct_inner) then add_plain(pt_outer).
+            // negate/add_plain are cheap (O(N)); not counted in analytical model.
+            Ciphertext ct_diff = ct_inner_chunks[c];   // local copy
+            eval.negate_inplace(ct_diff);
+            eval.add_plain_inplace(ct_diff, pt_outer);
+
+            // Slot-wise BETWEEN: cmp_lo_val < ct_diff < cmp_hi_val
+            Ciphertext ct_mask = fhe_between_shifted(
+                ct_diff, comp, eval, rk, benc, total_slots, ops,
+                cmp_lo_val, cmp_hi_val);
+
+            // Zero-out padding slots in any partial chunk.
+            // Padding diff = outer_i+offset_val - 0 = outer_i+offset may
+            // fall in [cmp_lo, cmp_hi] and create spurious matches.
+            // Always applied at small sizes (active << total_slots).
+            if (active < total_slots) {
+                std::vector<int64_t> mask_sel(total_slots, 0);
+                for (int j = 0; j < active; j++) mask_sel[j] = 1;
+                Plaintext pt_sel; benc.encode(mask_sel, pt_sel);
+                eval.multiply_plain_inplace(ct_mask, pt_sel);
+                ops.he_mul_pt++;
+            }
+
+            // Reduce all slots to a global scalar.
+            // rotation_sum_both_rows fills EVERY slot with sum(row0)+sum(row1),
+            // so all slots of ct_reduced = #{j in chunk: match(outer_i, inner_j)}.
+            Ciphertext ct_reduced = rotation_sum_both_rows(
+                eval, gk, ct_mask, row_slots, ops);
+
+            // Accumulate global COUNT
+            if (!acc_ready) {
+                ct_acc    = ct_reduced;
+                acc_ready = true;
+            } else {
+                eval.add_inplace(ct_acc, ct_reduced);
+                ops.he_add_ct++;
+            }
+
+            // A3: SUM(outer payload)
+            // All slots of ct_reduced = count_for_(i,c).
+            // ct_contrib = OUTER_PAYLOAD[i] × ct_reduced → payload[i] × #matches in chunk c.
+            // Accumulated ct_sum_acc decodes to Σ_i payload[i] × (total_matches_i) = SUM.
+            if (compute_sum) {
+                std::vector<int64_t> pay_bcast(total_slots, OUTER_PAYLOAD[i]);
+                Plaintext pt_pay; benc.encode(pay_bcast, pt_pay);
+                Ciphertext ct_contrib;
+                eval.multiply_plain(ct_reduced, pt_pay, ct_contrib);
+                ops.he_mul_pt++;
+                if (!sum_acc_ready) {
+                    ct_sum_acc    = ct_contrib;
+                    sum_acc_ready = true;
+                } else {
+                    eval.add_inplace(ct_sum_acc, ct_contrib);
+                    ops.he_add_ct++;
+                }
+            }
+        }
+    }
+
+    wall_s = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+
+    static const int64_t PLAIN_MOD = 65537;
+
+    // Decode COUNT from slot[0] (same unsigned-mod convention as helios_tiling_fhe)
+    Plaintext pt_result; decryptor.decrypt(ct_acc, pt_result);
+    std::vector<int64_t> decoded; benc.decode(pt_result, decoded);
+    int64_t raw       = decoded[0];
+    int64_t count_val = ((raw % PLAIN_MOD) + PLAIN_MOD) % PLAIN_MOD;
+
+    // A3: Decode SUM from slot[0]
+    int64_t sum_val = 0;
+    if (compute_sum && sum_acc_ready) {
+        Plaintext pt_s; decryptor.decrypt(ct_sum_acc, pt_s);
+        std::vector<int64_t> dec_s; benc.decode(pt_s, dec_s);
+        int64_t raw_s = dec_s[0];
+        sum_val = ((raw_s % PLAIN_MOD) + PLAIN_MOD) % PLAIN_MOD;
+    }
+
+    return FheResult{count_val, sum_val};
+}
+
+// ============================================================
 //  Multi-seed correctness check
 //  Runs SEED_CHECK_K quick FHE trials (n=8, m=6) with different seeds.
 //  Returns true only if all pass.  Catches comparator boundary bugs early.
@@ -875,6 +1047,65 @@ static void write_csv(
           << "\n";
     }
     std::cout << "  CSV appended to " << path << "\n\n";
+}
+
+// ============================================================
+//  F1 measured-vs-analytical table
+//  Printed only in 'small'/'f1' mode.  Shows whether CMP × lt_s predicts
+//  measured wall time, anchoring the large-bucket extrapolations (25 h / 50 h
+//  / 194 h) for a systems reviewer.
+// ============================================================
+static void print_f1_table(
+    const std::vector<BenchResult>& R,
+    const PerOpTimes& T)
+{
+    auto fmt_s = [](double s) -> std::string {
+        std::ostringstream ss;
+        if      (s <= 0)    ss << "-";
+        else if (s >= 3600) ss << std::fixed << std::setprecision(1) << s/3600 << "h";
+        else if (s >= 60)   ss << std::fixed << std::setprecision(1) << s/60   << "m";
+        else                ss << std::fixed << std::setprecision(2) << s      << "s";
+        return ss.str();
+    };
+    std::cout << "\n[F1 Measured vs Analytical  (anchors large-bucket extrapolations)]\n";
+    std::cout << "  lt_s=" << std::fixed << std::setprecision(3) << T.lt_s << "s\n";
+    print_sep(134);
+    std::cout << std::left  << std::setw(20) << "Backend"
+              << std::right
+              << std::setw(8)  << "CMP"
+              << std::setw(18) << "Pred(CMP×lt_s)"
+              << std::setw(18) << "Measured"
+              << std::setw(10) << "Ratio"
+              << std::setw(12) << "COUNT OK?"
+              << std::setw(12) << "SUM OK?"
+              << "\n";
+    print_sep(134);
+    for (const auto& r : R) {
+        double pred  = (double)r.ops.total_cmp() * T.lt_s;
+        double ratio = (r.ran_actual && pred > 0 && r.wall_actual_s > 0)
+                       ? r.wall_actual_s / pred : 0.0;
+        std::string cnt_ok = r.ran_actual ? (r.correct     ? "PASS" : "FAIL") : "(analytic)";
+        std::string sum_ok = r.ran_actual ? (r.sum_correct ? "PASS" : "FAIL") : "(analytic)";
+        std::cout << std::left  << std::setw(20) << r.name
+                  << std::right
+                  << std::setw(8)  << r.ops.total_cmp()
+                  << std::setw(18) << fmt_s(pred)
+                  << std::setw(18) << (r.ran_actual ? fmt_s(r.wall_actual_s) : "-")
+                  << std::setw(10);
+        if (r.ran_actual && ratio > 0)
+            std::cout << std::fixed << std::setprecision(2) << ratio << "x";
+        else
+            std::cout << "-";
+        std::cout << std::setw(12) << cnt_ok
+                  << std::setw(12) << sum_ok
+                  << "\n";
+    }
+    print_sep(134);
+    std::cout
+        << "  Ratio < 1  → measured faster than CMP-only prediction (rotation\n"
+        << "               overhead absorbed; extrapolation is conservative).\n"
+        << "  Ratio ~ 1  → CMP dominates wall time; large-bucket extrapolation valid.\n"
+        << "  Ratio > 1  → other overhead significant; investigate before scaling.\n";
 }
 
 static void print_results(
@@ -1058,24 +1289,40 @@ int main(int argc, char* argv[])
     // Flush every write immediately so progress shows through tee/pipes on Linux.
     std::cout.setf(std::ios::unitbuf);
 
-    int  N_B      = 1974;
-    int  M_B      = 1028;
-    bool quick    = false;
-    bool recalib  = false;   // force fresh calibration (ignores cache)
-    bool dateband = false;   // A4: use date-band residual instead of synthetic band
+    int  N_B        = 1974;
+    int  M_B        = 1028;
+    bool quick      = false;
+    bool recalib    = false;   // force fresh calibration (ignores cache)
+    bool dateband   = false;   // A4: use date-band residual instead of synthetic band
+    // F1: run all four backends in real FHE at a small feasible size.
+    //   Default 32×32: Naive CMP=64 → ~3.1 h; HELIOS CMP=2 → ~6 min.
+    //   Usage: ./bench small         → 32×32 all backends measured
+    //          ./bench small 16      → 16×16 (~1.5 h for Naive)
+    //          ./bench small 64      → 64×64 (~12 h for Naive)
+    //          ./bench f1            → alias for 'small'
+    bool small_mode = false;
+    int  small_size = 32;
 
     int pos_arg = 0;
     for (int i = 1; i < argc; i++) {
-        if      (std::strcmp(argv[i], "quick")    == 0) quick    = true;
-        else if (std::strcmp(argv[i], "recalib")  == 0) recalib  = true;
-        else if (std::strcmp(argv[i], "dateband") == 0) dateband = true;  // A4
+        if      (std::strcmp(argv[i], "quick")    == 0) quick      = true;
+        else if (std::strcmp(argv[i], "recalib")  == 0) recalib    = true;
+        else if (std::strcmp(argv[i], "dateband") == 0) dateband   = true;   // A4
+        else if (std::strcmp(argv[i], "small")    == 0) small_mode = true;   // F1
+        else if (std::strcmp(argv[i], "f1")       == 0) small_mode = true;   // F1 alias
         else if (std::isdigit((unsigned char)argv[i][0])) {
-            if      (pos_arg == 0) N_B = std::atoi(argv[i]);
-            else if (pos_arg == 1) M_B = std::atoi(argv[i]);
-            pos_arg++;
+            int val = std::atoi(argv[i]);
+            if (small_mode) {
+                small_size = val;   // e.g. 'small 8' → 8×8
+            } else {
+                if      (pos_arg == 0) N_B = val;
+                else if (pos_arg == 1) M_B = val;
+                pos_arg++;
+            }
         }
     }
-    if (quick) { N_B = SEED_CHECK_N; M_B = SEED_CHECK_M; }
+    if (quick)      { N_B = SEED_CHECK_N; M_B = SEED_CHECK_M; }
+    if (small_mode) { N_B = small_size;   M_B = small_size;   }
 
     // A4: select active band parameters based on mode
     int active_offset = dateband ? DATE_OFFSET : OFFSET;
@@ -1287,30 +1534,100 @@ int main(int argc, char* argv[])
     std::vector<BenchResult> results;
     static const int64_t PM = 65537;  // plaintext modulus
 
-    // Backend 1: Naive (analytical)
+    // Backend 1: Naive
+    //   Standard mode: analytical only (count_naive + extrapolate_s).
+    //   small_mode:    actual FHE nested-loop (nested_loop_fhe, A outer, B inner).
     {
-        std::cout << "[Backend 1] Naive (analytical) ...\n";
-        OpStats ops = count_naive(N_B, M_B, total_slots);
-        double  ext = extrapolate_s(ops, T);
-        int64_t pk  = (int64_t)mem_naive.resident_cts;
-        std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
-                  << "  extrap=" << std::fixed << std::setprecision(0)
-                  << ext << "s (~" << ext/3600 << "h)\n\n";
-        results.push_back({"1-Naive", ops, 0, ext, pk, pk*ct_mb, true, false,
-                            0, gt_sum % PM, false, mem_naive});
+        int64_t pk_b1 = (int64_t)mem_naive.resident_cts;
+        if (!small_mode) {
+            std::cout << "[Backend 1] Naive (analytical) ...\n";
+            OpStats ops = count_naive(N_B, M_B, total_slots);
+            double  ext = extrapolate_s(ops, T);
+            std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
+                      << "  extrap=" << std::fixed << std::setprecision(0)
+                      << ext << "s (~" << ext/3600 << "h)\n\n";
+            results.push_back({"1-Naive", ops, 0, ext, pk_b1, pk_b1*ct_mb, true, false,
+                                0, gt_sum % PM, false, mem_naive});
+        } else {
+            // F1: run actual FHE.  Naive always uses A as outer, B as inner.
+            // gt_sum (HELIOS orientation A-outer at N_B=M_B) matches Naive's SUM.
+            std::cout << "[Backend 1] Naive (actual FHE, F1: n=" << N_B
+                      << " m=" << M_B << ") ...\n";
+            OpStats ops1; ops1.reset();
+            double  wall1 = 0;
+            bool    cs1   = (!a_payload.empty() && !b_payload.empty());
+            FheResult fhe1 = nested_loop_fhe(
+                A, B,               // Naive: A outer, B inner (no orientation swap)
+                a_payload, cs1,
+                comparator, evaluator, encryptor, decryptor,
+                benc, rlk, gk, row_slots, total_slots, ops1, wall1,
+                active_offset, active_cmp_lo, active_cmp_hi);
+            bool ok1     = (fhe1.count == gt_count % PM);
+            bool sum_ok1 = cs1 && (fhe1.sum == gt_sum % PM);
+            double ext1  = extrapolate_s(ops1, T);
+            std::cout << "  CMP=" << ops1.total_cmp()
+                      << "  wall=" << std::fixed << std::setprecision(1) << wall1 << "s"
+                      << "  fhe_count=" << fhe1.count
+                      << "  gt=" << (gt_count % PM) << "  " << (ok1 ? "PASS" : "FAIL")
+                      << "  fhe_sum=" << fhe1.sum
+                      << "  gt_sum(mod)=" << (gt_sum % PM)
+                      << "  sum:" << (sum_ok1 ? "PASS" : "FAIL") << "\n\n";
+            results.push_back({"1-Naive", ops1, wall1, ext1, pk_b1, pk_b1*ct_mb,
+                                ok1, true, fhe1.sum, gt_sum % PM, sum_ok1, mem_naive});
+        }
     }
 
-    // Backend 2: Fixed orientation (analytical)
+    // Backend 2: FixedOrient
+    //   Standard mode: analytical only.
+    //   small_mode:    actual FHE nested-loop (smaller side outer, larger inner).
     {
-        std::cout << "[Backend 2] FixedOrient (analytical) ...\n";
-        OpStats ops = count_fixed(N_B, M_B, total_slots);
-        double  ext = extrapolate_s(ops, T);
-        int64_t pk  = (int64_t)mem_fixed.resident_cts;
-        std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
-                  << "  extrap=" << std::fixed << std::setprecision(0)
-                  << ext << "s (~" << ext/3600 << "h)\n\n";
-        results.push_back({"2-FixedOrient", ops, 0, ext, pk, pk*ct_mb, true, false,
-                            0, gt_sum % PM, false, mem_fixed});
+        int64_t pk_b2 = (int64_t)mem_fixed.resident_cts;
+        if (!small_mode) {
+            std::cout << "[Backend 2] FixedOrient (analytical) ...\n";
+            OpStats ops = count_fixed(N_B, M_B, total_slots);
+            double  ext = extrapolate_s(ops, T);
+            std::cout << "  CMP=" << ops.total_cmp() << "  ROT=" << ops.he_rot
+                      << "  extrap=" << std::fixed << std::setprecision(0)
+                      << ext << "s (~" << ext/3600 << "h)\n\n";
+            results.push_back({"2-FixedOrient", ops, 0, ext, pk_b2, pk_b2*ct_mb, true, false,
+                                0, gt_sum % PM, false, mem_fixed});
+        } else {
+            // F1: run actual FHE.  FixedOrient puts the smaller side outer.
+            // swap when M_B < N_B; at N_B=M_B (all small_mode sizes) no swap occurs.
+            bool fo_swap = (M_B < N_B);
+            const std::vector<int64_t>& FO_OUTER = fo_swap ? B : A;
+            const std::vector<int64_t>& FO_INNER = fo_swap ? A : B;
+            const std::vector<int64_t>& FO_PAY   = fo_swap ? b_payload : a_payload;
+            // At N_B=M_B, fo_swap=false → OUTER=A → SUM matches gt_sum (A-outer).
+            std::cout << "[Backend 2] FixedOrient (actual FHE, F1: n=" << N_B
+                      << " m=" << M_B
+                      << (fo_swap ? " [swapped: B outer]" : " [A outer]") << ") ...\n";
+            OpStats ops2; ops2.reset();
+            double  wall2 = 0;
+            bool    cs2   = (!a_payload.empty() && !b_payload.empty());
+            FheResult fhe2 = nested_loop_fhe(
+                FO_OUTER, FO_INNER, FO_PAY, cs2,
+                comparator, evaluator, encryptor, decryptor,
+                benc, rlk, gk, row_slots, total_slots, ops2, wall2,
+                active_offset, active_cmp_lo, active_cmp_hi);
+            // gt_sum is SUM(outer_payload of HELIOS orientation).
+            // At N_B=M_B, HELIOS also uses A outer, so gt_sum matches fo_sum.
+            int64_t fo_gt_sum = fo_swap
+                ? plaintext_sum_payload(B, A, active_delta, b_payload) % PM
+                : gt_sum % PM;
+            bool ok2     = (fhe2.count == gt_count % PM);
+            bool sum_ok2 = cs2 && (fhe2.sum == fo_gt_sum);
+            double ext2  = extrapolate_s(ops2, T);
+            std::cout << "  CMP=" << ops2.total_cmp()
+                      << "  wall=" << std::fixed << std::setprecision(1) << wall2 << "s"
+                      << "  fhe_count=" << fhe2.count
+                      << "  gt=" << (gt_count % PM) << "  " << (ok2 ? "PASS" : "FAIL")
+                      << "  fhe_sum=" << fhe2.sum
+                      << "  gt_sum(mod)=" << fo_gt_sum
+                      << "  sum:" << (sum_ok2 ? "PASS" : "FAIL") << "\n\n";
+            results.push_back({"2-FixedOrient", ops2, wall2, ext2, pk_b2, pk_b2*ct_mb,
+                                ok2, true, fhe2.sum, fo_gt_sum, sum_ok2, mem_fixed});
+        }
     }
 
     // Backend 3: HELIOS tile (non-fused memory model; fused execution)
@@ -1375,5 +1692,18 @@ int main(int argc, char* argv[])
                   row_slots, total_slots, ct_mb, dateband, active_delta);
     write_csv(results, N_B, M_B, row_slots, total_slots, ct_mb,
               gt_count, gt_sum, dateband);
+
+    // F1: measured-vs-analytical table (only in small/f1 mode)
+    if (small_mode) {
+        print_f1_table(results, T);
+        std::cout << "\n[F1 Summary]\n";
+        std::cout << "  Mode: ALL FOUR backends measured in real FHE (n=" << N_B
+                  << " m=" << M_B << ")\n";
+        std::cout << "  Backends 1+2 (Naive, FixedOrient) are measured FHE baselines;\n";
+        std::cout << "  their CMP×lt_s ratios anchor the large-bucket extrapolations\n";
+        std::cout << "  (256×512→~25h, 512×256→~50h, 1974×1028→~194h).\n";
+        std::cout << "  Run with 'small 64' for a more convincing validation point.\n";
+    }
+
     return 0;
 }
