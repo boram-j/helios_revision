@@ -1,10 +1,13 @@
 // =============================================================================
 // ntt.cu — Negacyclic NTT / INTT CUDA implementation
 //
-// Algorithm: SEAL-compatible negacyclic NTT in Z[X]/(X^N + 1).
-// Root table: table[idx] = psi^{bit_rev(idx, logN+1)} mod p, idx = 1..N-1.
+// Algorithm: Negacyclic NTT in Z[X]/(X^N + 1).
+// Root table: table[idx] = psi^{bit_rev(idx, logN)} mod p, idx = 1..N-1.
+// Using logN bits (not logN+1) makes last-stage twiddles odd powers of psi,
+// which correctly implements the negacyclic ring evaluation and the ring
+// homomorphism NTT(a*b) = NTT(a) ⊙ NTT(b).
 // Forward: CT butterfly, ascending m.  Inverse: GS butterfly, descending h.
-// Verified by roundtrip test in verify/verify_layer1.cu.
+// Verified by roundtrip + poly mul tests in verify/verify_layer1.cu.
 // =============================================================================
 
 #include "ntt.cuh"
@@ -151,16 +154,20 @@ static void k_scale_multi(uint64_t*       poly,
 // ---------------------------------------------------------------------------
 // Host: root table construction
 //
-// table[idx] = psi^{bit_rev(idx, logN+1)} mod p,  for idx = 1 .. N-1
-// table[0] = 0 (unused sentinel)
+// table[idx] = psi^{bit_rev(idx, logN)} mod p,  for idx = 1 .. N-1
+// table[0] = 0 (unused sentinel; index 0 is never accessed in CT/GS loops)
 // ---------------------------------------------------------------------------
 static void build_ntt_table(uint64_t* h_table, int N, uint64_t psi, uint64_t p)
 {
     int logN = 0;
     { int tmp = N; while (tmp > 1) { logN++; tmp >>= 1; } }
-    int bits = logN + 1;   // bit-width for the reversal
+    // Use logN bits (NOT logN+1): roots[m+i] = psi^{bit_rev(m+i, logN)} ensures
+    // the last-stage twiddles are odd powers of psi (psi^1, psi^3, ...), which
+    // implements the negacyclic ring Z[X]/(X^N+1) evaluation correctly and
+    // satisfies NTT(a*b) = NTT(a) ⊙ NTT(b).
+    int bits = logN;
 
-    h_table[0] = 0;
+    h_table[0] = 0;   // index 0 unused (m+i always >= 1)
     for (int idx = 1; idx < N; idx++) {
         uint32_t br = bit_reverse((uint32_t)idx, bits);
         h_table[idx] = powmod(psi, (uint64_t)br, p);

@@ -24,12 +24,14 @@
 //       a[j] = U+V, a[j+t] = (U-V) * S mod p
 //   Then: a[i] *= N^{-1} mod p for all i.
 //
-// ROOT TABLE (SEAL-compatible negacyclic layout)
-// -----------------------------------------------
-//   table_fwd[idx] = psi^{bit_rev(idx, logN+1)} mod p,  idx = 1 .. N-1
-//   table_inv[idx] = psi_inv^{bit_rev(idx, logN+1)} mod p,  idx = 1 .. N-1
+// ROOT TABLE (negacyclic layout)
+// --------------------------------
+//   table_fwd[idx] = psi^{bit_rev(idx, logN)} mod p,  idx = 1 .. N-1
+//   table_inv[idx] = psi_inv^{bit_rev(idx, logN)} mod p,  idx = 1 .. N-1
 //
-//   where psi is the primitive 2N-th root of unity mod p.
+//   where psi is the primitive 2N-th root of unity mod p (psi^N ≡ -1 mod p).
+//   Using logN bits (not logN+1) ensures last-stage twiddles are odd powers of
+//   psi, giving the correct negacyclic ring homomorphism NTT(a*b) = NTT(a) ⊙ NTT(b).
 //   Index 0 is unused (set to 0).
 //
 // ARRAY LAYOUT

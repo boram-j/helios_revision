@@ -292,16 +292,31 @@ static void test_modup_moddown()
     char detail[128];
 
     // ── 3a: ModUp extension accuracy ───────────────────────────────────────
-    // Polynomial a with coefficients in [0,40] (< all primes).
-    // After ModUp, the P-extension should equal a mod P = a (since a < P).
+    // FastBConv (approximate base extension) computes:
+    //   ext[j] = sum_i x_i * (Q/q_i mod P) mod P
+    //   where x_i = a_i * (Q/q_i)^{-1} mod q_i.
+    // This equals a mod P + e*(Q mod P) for integer e ∈ {0,..,L-1} (approximation).
+    // We compute the exact same formula on the host as the reference and verify the
+    // GPU gives an identical result (tests kernel correctness, not mathematical exactness).
     {
         std::uniform_int_distribution<uint64_t> dist(0, 40);
         std::vector<uint64_t> h_a0(N), h_a1(N), expected_P(N);
+
+        // Host-side FastBConv precomputed constants (mirrors rns_modup_params_create)
+        uint64_t hat_inv_q0 = invmod(q1 % q0, q0);  // (Q/q0)^{-1} mod q0 = q1^{-1} mod q0
+        uint64_t hat_inv_q1 = invmod(q0 % q1, q1);  // (Q/q1)^{-1} mod q1 = q0^{-1} mod q1
+        uint64_t hat_q0_P   = q1 % P;               // (Q/q0) mod P
+        uint64_t hat_q1_P   = q0 % P;               // (Q/q1) mod P
+
         for (int i = 0; i < N; i++) {
-            uint64_t c = dist(rng);
-            h_a0[i]       = c % q0;
-            h_a1[i]       = c % q1;
-            expected_P[i] = c % P;   // c < 41 < 103, so expected_P[i] == c
+            uint64_t c  = dist(rng);
+            h_a0[i]     = c % q0;
+            h_a1[i]     = c % q1;
+            // Reference FastBConv output (matches k_modup_step1 + k_modup_step2)
+            uint64_t x0 = mulmod(h_a0[i], hat_inv_q0, q0);
+            uint64_t x1 = mulmod(h_a1[i], hat_inv_q1, q1);
+            expected_P[i] = (uint64_t)(((__uint128_t)x0 * hat_q0_P +
+                                        (__uint128_t)x1 * hat_q1_P) % P);
         }
 
         std::vector<uint64_t> h_in(2 * N);
@@ -320,10 +335,10 @@ static void test_modup_moddown()
             if (h_qp[2 * N + i] != expected_P[i]) bad++;
 
         snprintf(detail, sizeof(detail),
-                 "FastBConv: N=%d q=[%llu,%llu] P=%llu ext_mismatches=%d",
+                 "FastBConv: N=%d q=[%llu,%llu] P=%llu gpu_vs_host_mismatches=%d",
                  N, (unsigned long long)q0, (unsigned long long)q1,
                  (unsigned long long)P, bad);
-        report("ModUp extension accuracy (FastBConv)", bad == 0, detail);
+        report("ModUp extension (FastBConv gpu==host ref)", bad == 0, detail);
 
         cudaFree(d_in);
         cudaFree(d_qp);

@@ -60,8 +60,8 @@ struct NttTable {
     uint64_t  N_inv;       // N^{-1} mod p (for INTT normalization)
     int       N;           // polynomial degree this table is built for
     // Device arrays, each of length N:
-    uint64_t* d_roots;     // d_roots[idx]     = psi^{bit_rev(idx, logN+1)} mod p
-    uint64_t* d_roots_inv; // d_roots_inv[idx] = psi_inv^{bit_rev(idx, logN+1)} mod p
+    uint64_t* d_roots;     // d_roots[idx]     = psi^{bit_rev(idx, logN)} mod p
+    uint64_t* d_roots_inv; // d_roots_inv[idx] = psi_inv^{bit_rev(idx, logN)} mod p
 };
 
 // ---------------------------------------------------------------------------
