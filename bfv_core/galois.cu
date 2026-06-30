@@ -7,54 +7,12 @@
 namespace bfv_core {
 
 // ---------------------------------------------------------------------------
-// Index permutation kernel
-//
-// For each output position i, find the source position j such that k*j ≡ i (mod 2N).
-// Equivalently: output[k*j mod 2N] = ±input[j], so we iterate over j and
-// write to output[k*j mod 2N].
-//
-// We use the "scatter" approach (iterate over source index j, write to dest).
-// This is not coalesced on writes but simple to implement. A gather (iterate
-// over dest, compute source) gives coalesced reads but uncoalesced writes of
-// source — same asymmetry. For large N, a precomputed permutation table gives
-// coalesced access on both sides; noted as a tuning opportunity.
-//
-// Thread j (0 ≤ j < N) in prime row l:
-//   mapped = (k * j) % (2*N)
-//   if mapped < N: out[mapped] = in[j]
-//   else:          out[mapped - N] = (p - in[j]) % p  (negate: X^N ≡ -1)
-// ---------------------------------------------------------------------------
-__global__
-static void k_galois_scatter(
-    const uint64_t* __restrict__ in,
-    uint64_t*       __restrict__ out,
-    int             N,
-    uint32_t        galois_elt,
-    const uint64_t* __restrict__ primes)
-{
-    int j = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int l = (int)blockIdx.y;
-    if (j >= N) return;
-
-    uint64_t p      = primes[l];
-    size_t   off_in = (size_t)l * N + j;
-    uint64_t val    = in[off_in];
-
-    // mapped = (galois_elt * j) mod 2N
-    uint64_t mapped = ((uint64_t)galois_elt * (uint64_t)j) % ((uint64_t)2 * N);
-
-    size_t dest;
-    if (mapped < (uint64_t)N) {
-        dest = (size_t)l * N + (size_t)mapped;
-        out[dest] = val;
-    } else {
-        dest = (size_t)l * N + (size_t)(mapped - N);
-        out[dest] = negmod(val, p);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Gather kernel: for each output position i, read from source j = k^{-1}*i mod 2N.
+//
+// Chosen over a scatter approach because reads from `in` are coalesced
+// (sequential output indices i → sequential source indices when k_inv is small).
+// For large N a precomputed permutation table would make both directions fully
+// coalesced — noted as a tuning opportunity.
 // This requires k_inv = k^{-1} mod 2N passed in.
 // Coalesced reads if stride is 1 (which it is for sequential i).
 // ---------------------------------------------------------------------------

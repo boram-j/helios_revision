@@ -47,18 +47,7 @@
 
 namespace bfv_core {
 
-// ---------------------------------------------------------------------------
-// NttTable: per-prime NTT precomputed data
-// ---------------------------------------------------------------------------
-struct NttTable {
-    uint64_t  p;          // prime
-    uint64_t  psi;        // primitive 2N-th root of unity mod p
-    uint64_t  psi_inv;    // psi^{-1} mod p
-    uint64_t  N_inv;      // N^{-1} mod p (for INTT normalization)
-    int       N;          // polynomial degree this table is built for
-    uint64_t* d_roots;    // device: d_roots[idx] = psi^{bit_rev(idx, logN+1)},  size N
-    uint64_t* d_roots_inv;// device: d_roots_inv[idx] = psi_inv^{bit_rev(idx,logN+1)}, size N
-};
+// NttTable is defined in bfv_params.cuh (the shared types header).
 
 // ---------------------------------------------------------------------------
 // Host: create / free NttTable

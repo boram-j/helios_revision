@@ -49,33 +49,19 @@ static constexpr uint64_t DEFAULT_PRIM_ROOTS_2N[8] = {
 
 // ---------------------------------------------------------------------------
 // NttTable: precomputed per-prime NTT tables (device memory)
+//
+// Field names match ntt.cuh / ntt.cu; defined here (in the shared types header)
+// so all Layer 1 headers can reference it without including ntt.cuh.
 // ---------------------------------------------------------------------------
 struct NttTable {
-    uint64_t p;          // prime
-    uint64_t g;          // primitive 2N-th root of unity mod p
-    uint64_t g_inv;      // g^{-1} mod p (primitive inverse root)
-    uint64_t N_inv;      // N^{-1} mod p (for INTT normalization)
-    int      N;          // polynomial degree this table is for
-    // Device arrays, each of size N:
-    uint64_t* roots;     // roots[i] = g^i mod p, bit-reversed order
-    uint64_t* roots_inv; // roots_inv[i] = g_inv^i mod p, bit-reversed order
-};
-
-// ---------------------------------------------------------------------------
-// RnsContext: everything needed to do arithmetic on a single RNS-level poly
-// ---------------------------------------------------------------------------
-struct RnsContext {
-    int        N;                       // polynomial degree
-    int        L;                       // number of base primes (Q)
-    int        K;                       // number of special primes (P)
-    NttTable   base_tables[MAX_RNS_PRIMES];  // for Q primes [0..L-1]
-    NttTable   spc_tables[MAX_RNS_PRIMES];   // for P primes [0..K-1]
-    // Precomputed ModUp/ModDown constants (see rns.cuh)
-    // base->special conversion
-    uint64_t*  modup_factors;  // device: [L * K] matrix — (Q/q_i)^{-1}_{q_i} * (Q/q_i mod p_j)
-    // special->base for ModDown
-    uint64_t*  moddown_P_inv_Q; // device: [L] array — P^{-1} mod q_i  (single-prime P case)
-    uint64_t   P;               // product of special primes (only meaningful if K=1 or small)
+    uint64_t  p;           // prime
+    uint64_t  psi;         // primitive 2N-th root of unity mod p
+    uint64_t  psi_inv;     // psi^{-1} mod p
+    uint64_t  N_inv;       // N^{-1} mod p (for INTT normalization)
+    int       N;           // polynomial degree this table is built for
+    // Device arrays, each of length N:
+    uint64_t* d_roots;     // d_roots[idx]     = psi^{bit_rev(idx, logN+1)} mod p
+    uint64_t* d_roots_inv; // d_roots_inv[idx] = psi_inv^{bit_rev(idx, logN+1)} mod p
 };
 
 // ---------------------------------------------------------------------------
