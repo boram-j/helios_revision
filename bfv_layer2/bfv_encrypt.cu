@@ -244,10 +244,14 @@ void bfv_decrypt(const BfvContext& ctx, const BfvSecretKey& sk,
                             ? (int64_t)(raw - q0)
                             : (int64_t)raw;
 
-        // Round: val = floor((coeff * t + q0/2) / q0) using __int128
-        // For valid decryption (|noise| < delta/2), numerator is non-negative.
+        // Round: val = round(coeff * t / q0) = floor((coeff * t + q0/2) / q0).
+        // IMPORTANT: use floor division, not C++ truncation.
+        // When coeff < 0 (m >= t/2 after center-lift), num can be negative and
+        // |num| < q0, so truncation gives 0 but the correct floor is -1.
+        // Fix: if the remainder is negative, subtract 1 (truncation → floor).
         __int128 num = (__int128)coeff * (int64_t)t + q0_half;
         int64_t  val = (int64_t)(num / (int64_t)q0);
+        if (num % (int64_t)q0 < 0) val--;   // truncation → floor
 
         // Reduce mod t to [0, t)
         int64_t t_s = (int64_t)t;
