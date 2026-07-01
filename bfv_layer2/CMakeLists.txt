@@ -43,6 +43,9 @@ add_library(bfv_layer2_1 STATIC
     bfv_context.cu
     bfv_types.cu
     bfv_encode.cu
+    bfv_keygen.cu
+    bfv_encrypt.cu
+    bfv_rotate.cu
 )
 
 target_include_directories(bfv_layer2_1 PUBLIC
@@ -78,6 +81,26 @@ set_target_properties(bfv_layer2_1_verify PROPERTIES
 )
 
 target_compile_options(bfv_layer2_1_verify PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${BFV_NVCC_FLAGS}>
+)
+
+# ── bfv_layer2_2_verify: rotation + full-pipeline verifier ───
+add_executable(bfv_layer2_2_verify
+    verify/verify_layer2_2.cu
+)
+
+target_link_libraries(bfv_layer2_2_verify PRIVATE bfv_layer2_1)
+
+target_include_directories(bfv_layer2_2_verify PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../bfv_core
+)
+
+set_target_properties(bfv_layer2_2_verify PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_compile_options(bfv_layer2_2_verify PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${BFV_NVCC_FLAGS}>
 )
 
