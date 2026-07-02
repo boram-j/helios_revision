@@ -190,8 +190,12 @@ void bfv_galois_keygen(const BfvContext& ctx, const BfvSecretKey& sk,
     const int K  = ctx.K;
     const int LK = L + K;
     const int N  = ctx.N;
-    const int beta = L;   // RNS decomposition: one digit per base prime
+    const int beta = 1;   // single key pair — bfv_rotate uses ModUp, not digit decomposition
 
+    // Single key pair (beta=1): use full ModUp of c1 in bfv_rotate, so one key
+    // suffices.  beta=L digit decomposition with zero-extension is NOT used
+    // because the zero special-prime accumulator means ModDown cannot subtract
+    // the large a·s·c1 term, producing noise ≈ q_l/2 >> Δ.
     gke.alloc(ctx, beta);
 
     // ── Build combined prime list QP = [q_0..q_{L-1}, p_0..p_{K-1}] ───────
@@ -226,7 +230,7 @@ void bfv_galois_keygen(const BfvContext& ctx, const BfvSecretKey& sk,
     const uint64_t P = ctx.special_primes[0];
     std::vector<uint64_t> P_scalars_h(LK);
     for (int l = 0; l < LK; l++)
-        P_scalars_h[l] = P % all_primes_h[l];   // P mod q_l (or P mod p_k)
+        P_scalars_h[l] = P % all_primes_h[l];   // P mod q_l (= 0 at l=L)
 
     uint64_t* d_P_scalars = nullptr;
     cudaMalloc(&d_P_scalars, (size_t)LK * sizeof(uint64_t));
@@ -239,60 +243,59 @@ void bfv_galois_keygen(const BfvContext& ctx, const BfvSecretKey& sk,
                                   d_P_scalars, N, LK, d_all_primes);
     P_s_gal.is_ntt = true;
 
-    // ── Per-digit key generation ───────────────────────────────────────────
-    for (int j = 0; j < beta; j++) {
-
-        // a[j]: uniform random over QP
-        {
-            std::vector<uint64_t> h_a_j((size_t)LK * N);
-            srand(100u + (unsigned)j);
-            for (int l = 0; l < LK; l++) {
-                uint64_t p   = all_primes_h[l];
-                uint64_t* row = h_a_j.data() + (size_t)l * N;
-                for (int i = 0; i < N; i++)
-                    row[i] = (uint64_t)rand() % p;
-            }
-            gke.a[j].copy_from_host(h_a_j.data(), LK);
-            gke.a[j].is_ntt = false;
-            ntt_all_limbs(gke.a[j].d_data, LK, N, ctx.ntt_tables);
-            gke.a[j].is_ntt = true;
+    // ── Single key pair (j=0 only) ─────────────────────────────────────────
+    // a[0]: uniform random over QP
+    {
+        std::vector<uint64_t> h_a_0((size_t)LK * N);
+        srand(100u);
+        for (int l = 0; l < LK; l++) {
+            uint64_t p   = all_primes_h[l];
+            uint64_t* row = h_a_0.data() + (size_t)l * N;
+            for (int i = 0; i < N; i++)
+                row[i] = (uint64_t)rand() % p;
         }
+        gke.a[0].copy_from_host(h_a_0.data(), LK);
+        gke.a[0].is_ntt = false;
+        ntt_all_limbs(gke.a[0].d_data, LK, N, ctx.ntt_tables);
+        gke.a[0].is_ntt = true;
+    }
 
-        // e_j: ternary error over QP
-        RnsPoly e_j;
-        e_j.alloc(ctx, LK);
-        {
-            std::vector<int>      ternary_ej(N);
-            std::vector<uint64_t> h_ej((size_t)LK * N);
-            sample_ternary_cpu(ternary_ej.data(), N, 200u + (unsigned)j);
-            encode_ternary_rns(h_ej.data(), ternary_ej.data(), N,
-                               all_primes_h.data(), LK);
-            e_j.copy_from_host(h_ej.data(), LK);
-            e_j.is_ntt = false;
-            ntt_all_limbs(e_j.d_data, LK, N, ctx.ntt_tables);
-            e_j.is_ntt = true;
-        }
+    // e_0: ternary error over QP
+    RnsPoly e_0;
+    e_0.alloc(ctx, LK);
+    {
+        std::vector<int>      ternary_e0(N);
+        std::vector<uint64_t> h_e0((size_t)LK * N);
+        sample_ternary_cpu(ternary_e0.data(), N, 200u);
+        encode_ternary_rns(h_e0.data(), ternary_e0.data(), N,
+                           all_primes_h.data(), LK);
+        e_0.copy_from_host(h_e0.data(), LK);
+        e_0.is_ntt = false;
+        ntt_all_limbs(e_0.d_data, LK, N, ctx.ntt_tables);
+        e_0.is_ntt = true;
+    }
 
-        // b[j] = -(a[j] * s + e_j) + P * s_galois   mod QP
+    // b[0] = -(a[0] * s + e_0) + P * s_galois   mod QP
+    {
         RnsPoly tmp;
         tmp.alloc(ctx, LK);
 
         bfv_core::poly_mul_rns(tmp.d_data,
-                               gke.a[j].d_data, sk.s.d_data,
+                               gke.a[0].d_data, sk.s.d_data,
                                N, LK, d_all_primes);
         bfv_core::poly_add_rns(tmp.d_data,
-                               tmp.d_data, e_j.d_data,
+                               tmp.d_data, e_0.d_data,
                                N, LK, d_all_primes);
-        bfv_core::poly_neg_rns(gke.b[j].d_data,
+        bfv_core::poly_neg_rns(gke.b[0].d_data,
                                tmp.d_data, N, LK, d_all_primes);
-        bfv_core::poly_add_rns(gke.b[j].d_data,
-                               gke.b[j].d_data, P_s_gal.d_data,
+        bfv_core::poly_add_rns(gke.b[0].d_data,
+                               gke.b[0].d_data, P_s_gal.d_data,
                                N, LK, d_all_primes);
-        gke.b[j].is_ntt = true;
+        gke.b[0].is_ntt = true;
 
         tmp.free();
-        e_j.free();
     }
+    e_0.free();
 
     // ── Cleanup ────────────────────────────────────────────────────────────
     cudaFree(d_all_primes);

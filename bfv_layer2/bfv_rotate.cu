@@ -6,17 +6,22 @@
 // Given ciphertext (c0, c1) encrypting m(X), rotate to produce
 // (c0', c1') encrypting σ_k(m)(X) = m(X^k) where k = galois_elt.
 //
-// Step 1 — Galois automorphism on both components:
-//   c0_gal = σ_k(c0),  c1_gal = σ_k(c1)
-//   Done in coefficient domain (INTT → apply_galois_inplace → NTT).
+// Step 1 — Galois automorphism on c0 (INTT → galois → NTT → L limbs NTT):
+//   c0_gal = σ_k(c0)
 //
-// Step 2 — Key-switch σ_k(c1) using GaloisKeyEntry gke:
-//   gke has beta=L digit pairs (b[j], a[j]), each L+K limbs, NTT form.
-//   Simple RNS digit decomposition: digit j = limb j of c1_gal,
-//   zero-extended to L+K limbs.
-//   Accumulate:
-//     ks_acc_b += gke.b[j] ⊙ digit_j   (ks_ip_single, L+K limbs)
-//     ks_acc_a += gke.a[j] ⊙ digit_j
+// Step 2 — Galois on c1 + ModUp + key-switch:
+//   c1_coeff = INTT(c1)                        [L limbs, coeff domain]
+//   c1_gal_coeff = σ_k(c1_coeff)               [L limbs, coeff domain]
+//   c1_gal_ext = ModUp(c1_gal_coeff, Q→QP)     [L+K limbs, coeff domain]
+//   c1_gal_ext_ntt = NTT(c1_gal_ext)           [L+K limbs, NTT domain]
+//   ks_acc_b = gke.b[0] ⊙ c1_gal_ext_ntt      [single key pair, L+K limbs]
+//   ks_acc_a = gke.a[0] ⊙ c1_gal_ext_ntt
+//
+//   WHY ModUp is needed: with zero-extension (special-prime slot = 0), the
+//   ModDown correction is 0, so the large a·s·c1 term is never subtracted.
+//   Noise becomes ≈ q_l/2 >> Δ ≈ q_0/t, destroying decryption.  With proper
+//   ModUp, the special-prime accumulator carries the cancellation value, and
+//   ModDown leaves noise ≈ N (small, < Δ).
 //
 // Step 3 — ModDown:
 //   rns_moddown: (L+K)*N → L*N  (K=1 required)
@@ -91,10 +96,10 @@ void bfv_rotate(const BfvContext&    ctx,
     uint64_t* d_primes_base = make_device_primes(ctx.primes,        L);
     uint64_t* d_primes_all  = make_device_primes(all_primes_h.data(), LK);
 
-    // ── Step 1: Galois automorphism on c0 and c1 ──────────────────────────────
+    // ── Step 1: Galois automorphism on c0 ────────────────────────────────────
     //
-    // Copy each component, INTT to coefficient domain, apply σ_k in-place,
-    // then NTT back.  c1_gal is kept until after the key-switch loop.
+    // INTT to coefficient domain, apply σ_k in-place, NTT back.
+    // c1 is handled separately below (needs ModUp before key-switch).
 
     RnsPoly c0_gal;
     c0_gal.alloc(ctx, L);
@@ -109,22 +114,50 @@ void bfv_rotate(const BfvContext&    ctx,
     ntt_fwd(c0_gal.d_data, L, N, ctx.ntt_tables);
     c0_gal.is_ntt = true;
 
+    // ── c1_gal: galois in coeff domain, then ModUp to L+K limbs, then NTT ───
+    //
+    // The zero-extension approach (digit_j = c1[j] at limb j, 0 elsewhere) is
+    // WRONG because the special-prime accumulator stays 0, so ModDown cannot
+    // subtract the large a·s·c1 term.  Noise becomes ≈ q_l/2 >> Δ.
+    //
+    // Correct approach: extend c1_gal to L+K limbs via proper ModUp (FastBConv)
+    // so the special-prime residue carries the cancellation term.  Then use a
+    // single key pair (beta=1 from bfv_galois_keygen) for the entire multiply.
+
     RnsPoly c1_gal;
     c1_gal.alloc(ctx, L);
     cudaMemcpy(c1_gal.d_data, ct_in.c1.d_data,
                (size_t)L * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice);
     c1_gal.is_ntt = true;
 
+    // INTT → coeff domain, apply galois, stay in coeff domain for ModUp
     ntt_inv(c1_gal.d_data, L, N, ctx.ntt_tables);
     c1_gal.is_ntt = false;
     bfv_core::apply_galois_inplace(c1_gal.d_data, galois_elt, N, L, d_primes_base);
     cudaDeviceSynchronize();
-    ntt_fwd(c1_gal.d_data, L, N, ctx.ntt_tables);
-    c1_gal.is_ntt = true;
+    // c1_gal is now σ_k(c1) in coefficient domain, L limbs
 
-    // ── Step 2: Key-switch c1_gal ──────────────────────────────────────────────
+    // ModUp from L to L+K limbs (still coeff domain)
+    RnsPoly c1_gal_ext;
+    c1_gal_ext.alloc(ctx, LK);
+    {
+        bfv_core::RnsModUpParams mup =
+            bfv_core::rns_modup_params_create(ctx.primes, L,
+                                               ctx.special_primes, K);
+        bfv_core::rns_modup(c1_gal_ext.d_data, c1_gal.d_data, N, mup);
+        cudaDeviceSynchronize();
+        bfv_core::rns_modup_params_free(mup);
+    }
+    c1_gal.free();   // L-limb coeff-domain copy no longer needed
+
+    // NTT all L+K limbs → evaluation domain
+    ntt_fwd(c1_gal_ext.d_data, LK, N, ctx.ntt_tables);
+    c1_gal_ext.is_ntt = true;
+
+    // ── Step 2: Key-switch using single key pair ───────────────────────────
     //
-    // Accumulators (L+K limbs, zero-init, NTT domain).
+    // ks_acc_b = gke.b[0] ⊙ c1_gal_ext   (L+K limbs, NTT domain)
+    // ks_acc_a = gke.a[0] ⊙ c1_gal_ext
     RnsPoly ks_acc_b, ks_acc_a;
     ks_acc_b.alloc(ctx, LK);
     ks_acc_a.alloc(ctx, LK);
@@ -133,30 +166,13 @@ void bfv_rotate(const BfvContext&    ctx,
     ks_acc_b.is_ntt = true;
     ks_acc_a.is_ntt = true;
 
-    // Digit buffer: (L+K) limbs; only limb j non-zero for digit j.
-    RnsPoly digit;
-    digit.alloc(ctx, LK);
-    digit.is_ntt = true;
-
-    for (int j = 0; j < L; j++) {
-        // Zero entire buffer, then copy limb j of c1_gal into limb j of digit.
-        cudaMemset(digit.d_data, 0, (size_t)LK * N * sizeof(uint64_t));
-        cudaMemcpy(digit.d_data + (size_t)j * N,
-                   c1_gal.d_data + (size_t)j * N,
-                   (size_t)N * sizeof(uint64_t),
-                   cudaMemcpyDeviceToDevice);
-
-        // ks_acc_b += gke.b[j] ⊙ digit_j  (mod each of the L+K primes)
-        bfv_core::ks_ip_single(gke.b[j].d_data, digit.d_data,
-                               ks_acc_b.d_data, N, LK, d_primes_all);
-        // ks_acc_a += gke.a[j] ⊙ digit_j
-        bfv_core::ks_ip_single(gke.a[j].d_data, digit.d_data,
-                               ks_acc_a.d_data, N, LK, d_primes_all);
-    }
+    bfv_core::ks_ip_single(gke.b[0].d_data, c1_gal_ext.d_data,
+                           ks_acc_b.d_data, N, LK, d_primes_all);
+    bfv_core::ks_ip_single(gke.a[0].d_data, c1_gal_ext.d_data,
+                           ks_acc_a.d_data, N, LK, d_primes_all);
     cudaDeviceSynchronize();
 
-    digit.free();
-    c1_gal.free();
+    c1_gal_ext.free();
 
     // ── Step 3: ModDown (L+K) → L limbs ───────────────────────────────────────
     //

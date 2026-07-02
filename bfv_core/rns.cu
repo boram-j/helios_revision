@@ -219,6 +219,10 @@ void rns_moddown_params_free(RnsModDownParams& p) {
 
 // ---------------------------------------------------------------------------
 // ModUp host wrapper
+//
+// Uses cudaMalloc/cudaFree (not the stream-ordered variants) for broad
+// compatibility: cudaMallocAsync requires CUDA driver >= 11.2 AND driver-level
+// support absent on some pre-Ampere GPUs, causing silent NULL returns.
 // ---------------------------------------------------------------------------
 void rns_modup(uint64_t* out, const uint64_t* in, int N,
                const RnsModUpParams& params, cudaStream_t stream)
@@ -232,8 +236,8 @@ void rns_modup(uint64_t* out, const uint64_t* in, int N,
                     cudaMemcpyDeviceToDevice, stream);
 
     // Temporary buffer for normalized base slices
-    uint64_t* tmp;
-    cudaMallocAsync(&tmp, (size_t)L * N * sizeof(uint64_t), stream);
+    uint64_t* tmp = nullptr;
+    cudaMalloc(&tmp, (size_t)L * N * sizeof(uint64_t));
 
     // Step 1: normalize base slices
     {
@@ -250,7 +254,9 @@ void rns_modup(uint64_t* out, const uint64_t* in, int N,
             tmp, ext, N, L, K, params.d_hat_mod_pj, params.d_p_primes);
     }
 
-    cudaFreeAsync(tmp, stream);
+    // Synchronise stream so kernels finish before freeing tmp
+    cudaStreamSynchronize(stream);
+    cudaFree(tmp);
 }
 
 // ---------------------------------------------------------------------------
