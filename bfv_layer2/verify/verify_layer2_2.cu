@@ -243,6 +243,20 @@ static void test5_rotate_step1() {
     for (int i = 0; ok && i < N; i++)
         if (pt_out.slots[i] != expected[i]) ok = false;
 
+    // Debug: always print first 4 slots so failures can be diagnosed on the
+    // target machine even before any test-harness output.
+    printf("    [dbg test5] first 4 actual vs expected (galois_elt=%u):\n",
+           (unsigned)galois_elt);
+    for (int i = 0; i < 4 && i < N; i++) {
+        uint64_t got  = pt_out.slots[i];   // slots has N entries after alloc+decrypt
+        uint64_t want = expected[i];
+        printf("      slot[%d]: got=%llu  want=%llu  %s\n",
+               i,
+               (unsigned long long)got,
+               (unsigned long long)want,
+               (got == want) ? "OK" : "MISMATCH");
+    }
+
     ct_rot.free();  ct.free();  pt.free();  pt_out.free();
     gke.free();  pk.free();  sk.free();  ctx.destroy();
     report("Test 5: rotation step=1 (galois_elt=3)", ok);

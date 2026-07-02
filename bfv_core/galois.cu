@@ -65,7 +65,14 @@ void apply_galois(const uint64_t* in,
 }
 
 // ---------------------------------------------------------------------------
-// In-place version: alloc temp, apply, copy back, free
+// In-place version: alloc temp, apply, copy back, free.
+//
+// Uses cudaMalloc/cudaFree (not the stream-ordered variants) for broad
+// compatibility: cudaMallocAsync requires CUDA driver >= 11.2 AND driver-level
+// support that is absent on some pre-Ampere GPUs, causing a silent NULL return
+// which turns the entire function into a no-op and breaks galois keygen and
+// ciphertext rotation.  The synchronising copy (cudaMemcpy) ensures the
+// temporary can be safely freed immediately after.
 // ---------------------------------------------------------------------------
 void apply_galois_inplace(uint64_t*       poly,
                            uint32_t        galois_elt,
@@ -74,12 +81,21 @@ void apply_galois_inplace(uint64_t*       poly,
                            const uint64_t* d_primes,
                            cudaStream_t    stream)
 {
-    uint64_t* tmp;
-    cudaMallocAsync(&tmp, (size_t)L * N * sizeof(uint64_t), stream);
+    uint64_t* tmp = nullptr;
+    cudaMalloc(&tmp, (size_t)L * N * sizeof(uint64_t));
+
+    // Launch gather kernel (async on `stream`)
     apply_galois(poly, galois_elt, tmp, N, L, d_primes, stream);
-    cudaMemcpyAsync(poly, tmp, (size_t)L * N * sizeof(uint64_t),
-                    cudaMemcpyDeviceToDevice, stream);
-    cudaFreeAsync(tmp, stream);
+
+    // Synchronise `stream` so the gather kernel is complete before we copy the
+    // result back.  (stream is almost always the null stream, in which case
+    // cudaStreamSynchronize is equivalent to cudaDeviceSynchronize.)
+    cudaStreamSynchronize(stream);
+
+    // Copy result back with a blocking DtoD copy, then free the temp buffer.
+    cudaMemcpy(poly, tmp, (size_t)L * N * sizeof(uint64_t),
+               cudaMemcpyDeviceToDevice);
+    cudaFree(tmp);
 }
 
 } // namespace bfv_core
